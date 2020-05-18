@@ -4,6 +4,7 @@
 #include "Interface/Core/InternalThreadState.h"
 #include "Interface/HLE/Syscalls.h"
 #include "Interface/HLE/x64/Syscalls.h"
+#include "Interface/HLE/x32/Syscalls.h"
 
 #include "LogManager.h"
 
@@ -143,13 +144,13 @@ SyscallHandler::SyscallHandler(FEXCore::Context::Context *ctx)
   , CTX {ctx} {
 }
 
-SyscallHandler *CreateHandler(OperatingMode Mode, FEXCore::Context::Context *ctx) {
-  if (Mode == MODE_64BIT) {
+SyscallHandler *CreateHandler(Context::OperatingMode Mode, FEXCore::Context::Context *ctx) {
+  if (Mode == Context::MODE_64BIT) {
     return FEXCore::HLE::x64::CreateHandler(ctx);
   }
-
-  LogMan::Msg::A("Don't yet handle 32bit syscalls");
-  return nullptr;
+  else {
+    return FEXCore::HLE::x32::CreateHandler(ctx);
+  }
 }
 
 uint64_t HandleSyscall(SyscallHandler *Handler, FEXCore::Core::InternalThreadState *Thread, FEXCore::HLE::SyscallArguments *Args) {
