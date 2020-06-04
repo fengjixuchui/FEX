@@ -258,8 +258,7 @@ JITCore::JITCore(FEXCore::Context::Context *ctx, FEXCore::Core::InternalThreadSt
   // XXX: Set this to a real minimum feature set in the future
   SetCPUFeatures(vixl::CPUFeatures::All());
 
-  bool HadRA = CTX->HasRegisterAllocationPass();
-  RAPass = CTX->GetRegisterAllocatorPass();
+  RAPass = Thread->PassManager->GetRAPass();
 
   // Just set the entire range as executable
   auto Buffer = GetBuffer();
@@ -285,20 +284,18 @@ JITCore::JITCore(FEXCore::Context::Context *ctx, FEXCore::Core::InternalThreadSt
     UsedRegisterCount -= NumCalleeGPRs + NumCalleeGPRPairs;
   }
 
-  if (!HadRA) {
-    RAPass->AllocateRegisterSet(UsedRegisterCount, RegisterClasses);
+  RAPass->AllocateRegisterSet(UsedRegisterCount, RegisterClasses);
 
-    RAPass->AddRegisters(FEXCore::IR::GPRClass, NumUsedGPRs);
-    RAPass->AddRegisters(FEXCore::IR::FPRClass, NumFPRs);
-    RAPass->AddRegisters(FEXCore::IR::GPRPairClass, NumUsedGPRPairs);
+  RAPass->AddRegisters(FEXCore::IR::GPRClass, NumUsedGPRs);
+  RAPass->AddRegisters(FEXCore::IR::FPRClass, NumFPRs);
+  RAPass->AddRegisters(FEXCore::IR::GPRPairClass, NumUsedGPRPairs);
 
-    RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRClass, NumUsedGPRs);
-    RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRPairClass, NumUsedGPRs);
+  RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRClass, NumUsedGPRs);
+  RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRPairClass, NumUsedGPRs);
 
-    for (uint32_t i = 0; i < NumUsedGPRPairs; ++i) {
-      RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2,     FEXCore::IR::GPRPairClass, i);
-      RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2 + 1, FEXCore::IR::GPRPairClass, i);
-    }
+  for (uint32_t i = 0; i < NumUsedGPRPairs; ++i) {
+    RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2,     FEXCore::IR::GPRPairClass, i);
+    RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2 + 1, FEXCore::IR::GPRPairClass, i);
   }
 }
 
@@ -374,6 +371,16 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
   uintptr_t ListBegin = CurrentIR->GetListData();
   uintptr_t DataBegin = CurrentIR->GetData();
 
+  auto HeaderIterator = CurrentIR->begin();
+  IR::OrderedNodeWrapper *HeaderNodeWrapper = HeaderIterator();
+  IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
+  auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
+  LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
+
+  if (HeaderOp->ShouldInterpret) {
+    return State->IntBackend->CompileCode(IR, DebugData);
+  }
+
   LogMan::Throw::A(RAPass->HasFullRA(), "Arm64 JIT only works with RA");
 
   uint32_t SpillSlots = RAPass->SpillSlots();
@@ -408,12 +415,6 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
   if (SpillSlots) {
     sub(sp, sp, SpillSlots * 16);
   }
-
-  auto HeaderIterator = CurrentIR->begin();
-  IR::OrderedNodeWrapper *HeaderNodeWrapper = HeaderIterator();
-  IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
-  auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
-  LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
 
   IR::OrderedNode *BlockNode = HeaderOp->Blocks.GetNode(ListBegin);
 
@@ -2824,6 +2825,48 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
         }
         break;
       }
+      case IR::OP_VABS: {
+        auto Op = IROp->C<IR::IROp_VAbs>();
+        uint8_t Elements = OpSize / Op->Header.ElementSize;
+        if (Op->Header.ElementSize == OpSize) {
+          // Scalar
+          switch (Op->Header.ElementSize) {
+            case 8: {
+              abs(GetDst(Node).D(), GetSrc(Op->Header.Args[0].ID()).D());
+            break;
+            }
+            default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+          }
+        }
+        else {
+          // Vector
+          switch (Op->Header.ElementSize) {
+            case 1:
+            case 2:
+            case 4:
+            case 8:
+              abs(GetDst(Node).VCast(OpSize * 8, Elements), GetSrc(Op->Header.Args[0].ID()).VCast(OpSize * 8, Elements));
+              break;
+            default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+          }
+        }
+        break;
+      }
+      case IR::OP_VADDV: {
+        auto Op = IROp->C<IR::IROp_VAddV>();
+        uint8_t Elements = OpSize / Op->Header.ElementSize;
+        // Vector
+        switch (Op->Header.ElementSize) {
+          case 1:
+          case 2:
+          case 4:
+          case 8:
+            addv(GetDst(Node).VCast(OpSize * 8, Elements), GetSrc(Op->Header.Args[0].ID()).VCast(OpSize * 8, Elements));
+            break;
+          default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+        }
+        break;
+      }
       case IR::OP_VFADD: {
         auto Op = IROp->C<IR::IROp_VFAdd>();
         if (Op->Header.ElementSize == OpSize) {
@@ -4298,6 +4341,22 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
 #else
           mrs(GetDst<RA_64>(Node), CNTVCT_EL0);
 #endif
+        break;
+      }
+      case IR::OP_FENCE: {
+        auto Op = IROp->C<IR::IROp_Fence>();
+        switch (Op->Fence) {
+          case IR::Fence_Load.Val:
+            dmb(FullSystem, BarrierReads);
+            break;
+          case IR::Fence_LoadStore.Val:
+            dmb(FullSystem, BarrierAll);
+            break;
+          case IR::Fence_Store.Val:
+            dmb(FullSystem, BarrierWrites);
+            break;
+          default: LogMan::Msg::A("Unknown Fence: %d", Op->Fence); break;
+        }
         break;
       }
       case IR::OP_DUMMY:

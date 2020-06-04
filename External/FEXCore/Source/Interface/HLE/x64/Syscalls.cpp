@@ -20,8 +20,8 @@
 #include "LogManager.h"
 
 namespace {
-  uint64_t Unimplemented(FEXCore::Core::InternalThreadState *Thread) {
-    LogMan::Msg::A("Unhandled system call");
+  uint64_t Unimplemented(FEXCore::Core::InternalThreadState *Thread, uint64_t SyscallNumber) {
+    ERROR_AND_DIE("Unhandled system call: %d", SyscallNumber);
     return -1;
   }
 
@@ -220,6 +220,13 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
     LogMan::Msg::D("munlockall(0x%lx) = %ld",
       Ret);
     break;
+  case SYSCALL_MSYNC:
+  LogMan::Msg::D("msync(%p, 0x%lx, 0x%lx) = %ld",
+      Args->Argument[1],
+      Args->Argument[2],
+      Args->Argument[3],
+      Ret);
+    break;
   case SYSCALL_PRCTL:
     LogMan::Msg::D("arch_prctl(%ld, %p, %p, %p, %p) = %ld",
       Args->Argument[1], Args->Argument[2],
@@ -303,6 +310,9 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
   case SYSCALL_CHDIR:
     LogMan::Msg::D("chdir(\"%s\") = %ld", reinterpret_cast<char const*>(Args->Argument[1]), Ret);
     break;
+  case SYSCALL_CHDIR:
+    LogMan::Msg::D("fchdir(\"%d\") = %ld", reinterpret_cast<int>(Args->Argument[1]), Ret);
+    break;
   case SYSCALL_RENAME:
     LogMan::Msg::D("rename(\"%s\", \"%s\") = %ld", reinterpret_cast<char const*>(Args->Argument[1]), reinterpret_cast<char const*>(Args->Argument[2]), Ret);
     break;
@@ -317,6 +327,9 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
     break;
   case SYSCALL_UNLINK:
     LogMan::Msg::D("unlink(\"%s\") = %ld", reinterpret_cast<char const*>(Args->Argument[1]), Ret);
+    break;
+  case SYSCALL_SYMLINK:
+    LogMan::Msg::D("symlink(\"%s\", \"%s\") = %ld", reinterpret_cast<char const*>(Args->Argument[1]), reinterpret_cast<char const*>(Args->Argument[2]), Ret);
     break;
   case SYSCALL_READLINK:
     LogMan::Msg::D("readlink(\"%s\") = %ld", reinterpret_cast<char const*>(Args->Argument[1]), Ret);
@@ -381,6 +394,16 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
       Args->Argument[4],
       Ret);
     break;
+  case SYSCALL_PSELECT6:
+    LogMan::Msg::D("pselect6(%d, %p, %p, %p, %p, %p) = %ld",
+      Args->Argument[1],
+      Args->Argument[2],
+      Args->Argument[3],
+      Args->Argument[4],
+      Args->Argument[5],
+      Args->Argument[6],
+      Ret);
+    break;
   case SYSCALL_PPOLL:
     LogMan::Msg::D("ppoll(%p, %d, %p, %p, %d) = %ld",
       Args->Argument[1],
@@ -407,6 +430,9 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
   case SYSCALL_TIMERFD_CREATE:
     LogMan::Msg::D("timerfd_create(%lx, %lx) = %ld", Args->Argument[1], Args->Argument[2], Ret);
     break;
+  case SYSCALL_ACCEPT4:
+    LogMan::Msg::D("accept4(%ld, %p, %p, %ld) = %ld", Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4], Ret);
+    break;
   case SYSCALL_EVENTFD:
     LogMan::Msg::D("eventfd(%lx, %ld) = %ld", Args->Argument[1], Args->Argument[2], Ret);
     break;
@@ -428,6 +454,22 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
   case SYSCALL_PRLIMIT64:
     LogMan::Msg::D("prlimit64(%ld, %ld, %p, %p) = %ld", Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4], Ret);
     break;
+  case SYSCALL_NAME_TO_HANDLE_AT:
+    LogMan::Msg::D("name_to_handle_at(%ld, \"%s\", %p, %p, %x) = %ld",
+      Args->Argument[1],
+      reinterpret_cast<char const*>(Args->Argument[2]),
+      Args->Argument[3],
+      Args->Argument[4],
+      Args->Argument[5],
+      Ret);
+    break;
+  case SYSCALL_OPEN_BY_HANDLE_AT:
+    LogMan::Msg::D("open_by_handle_at(%ld, %p, %x) = %ld",
+      Args->Argument[1],
+      Args->Argument[2],
+      Args->Argument[3],
+      Ret);
+    break;
   case SYSCALL_SENDMMSG:
     LogMan::Msg::D("sendmmsg(%ld, 0x%lx, %ld, %ld) = %ld", Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4], Ret);
     break;
@@ -445,6 +487,9 @@ void x64SyscallHandler::Strace(FEXCore::HLE::SyscallArguments *Args, uint64_t Re
     break;
   case SYSCALL_CONNECT:
     LogMan::Msg::D("connect(%ld, 0x%lx, %ld) = %ld", Args->Argument[1], Args->Argument[2], Args->Argument[3], Ret);
+    break;
+  case SYSCALL_ACCEPT:
+    LogMan::Msg::D("accept(%ld, %p, %p) = %ld", Args->Argument[1], Args->Argument[2], Args->Argument[3], Ret);
     break;
   case SYSCALL_SENDTO:
     LogMan::Msg::D("sendto(%ld, 0x%lx, %ld, %lx, 0x%lx, %ld) = %ld",
@@ -714,7 +759,7 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
 
   // Clear all definitions
   for (auto &Def : Definitions) {
-    Def.NumArgs = 0;
+    Def.NumArgs = 255;
     Def.Ptr = cvt(&Unimplemented);
   }
 
@@ -744,6 +789,7 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
     {SYSCALL_SELECT,                 cvt(&FEXCore::HLE::Select),                 5},
     {SYSCALL_SCHED_YIELD,            cvt(&FEXCore::HLE::Sched_Yield),            0},
     {SYSCALL_MREMAP,                 cvt(&FEXCore::HLE::Mremap),                 5},
+    {SYSCALL_MSYNC,                  cvt(&FEXCore::HLE::Msync),                  3},
     {SYSCALL_MINCORE,                cvt(&FEXCore::HLE::Mincore),                3},
     {SYSCALL_MADVISE,                cvt(&FEXCore::HLE::Madvise),                3},
     {SYSCALL_SHMGET,                 cvt(&FEXCore::HLE::Shmget),                 3},
@@ -759,6 +805,7 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
     {SYSCALL_GETPID,                 cvt(&FEXCore::HLE::Getpid),                 0},
     {SYSCALL_SOCKET,                 cvt(&FEXCore::HLE::Socket),                 3},
     {SYSCALL_CONNECT,                cvt(&FEXCore::HLE::Connect),                3},
+    {SYSCALL_ACCEPT,                 cvt(&FEXCore::HLE::Accept),                 3},
     {SYSCALL_SENDTO,                 cvt(&FEXCore::HLE::Sendto),                 6},
     {SYSCALL_RECVFROM,               cvt(&FEXCore::HLE::Recvfrom),               6},
     {SYSCALL_SENDMSG,                cvt(&FEXCore::HLE::Sendmsg),                3},
@@ -789,11 +836,13 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
     {SYSCALL_GETDENTS,               cvt(&FEXCore::HLE::Getdents),               3},
     {SYSCALL_GETCWD,                 cvt(&FEXCore::HLE::Getcwd),                 2},
     {SYSCALL_CHDIR,                  cvt(&FEXCore::HLE::Chdir),                  1},
+    {SYSCALL_FCHDIR,                 cvt(&FEXCore::HLE::Fchdir),                 1},
     {SYSCALL_RENAME,                 cvt(&FEXCore::HLE::Rename),                 2},
     {SYSCALL_MKDIR,                  cvt(&FEXCore::HLE::Mkdir),                  2},
     {SYSCALL_RMDIR,                  cvt(&FEXCore::HLE::Rmdir),                  1},
     {SYSCALL_LINK,                   cvt(&FEXCore::HLE::Link),                   2},
     {SYSCALL_UNLINK,                 cvt(&FEXCore::HLE::Unlink),                 1},
+    {SYSCALL_SYMLINK,                cvt(&FEXCore::HLE::Symlink),                2},
     {SYSCALL_READLINK,               cvt(&FEXCore::HLE::Readlink),               3},
     {SYSCALL_CHMOD,                  cvt(&FEXCore::HLE::Chmod),                  2},
     {SYSCALL_FCHMOD,                 cvt(&FEXCore::HLE::Fchmod),                 2},
@@ -867,17 +916,21 @@ void x64SyscallHandler::RegisterSyscallHandlers() {
     {SYSCALL_NEWFSTATAT,             cvt(&FEXCore::HLE::NewFStatat),             4},
     {SYSCALL_READLINKAT,             cvt(&FEXCore::HLE::Readlinkat),             4},
     {SYSCALL_FACCESSAT,              cvt(&FEXCore::HLE::FAccessat),              4},
+    {SYSCALL_PSELECT6,               cvt(&FEXCore::HLE::Pselect6),               6},
     {SYSCALL_PPOLL,                  cvt(&FEXCore::HLE::Ppoll),                  5},
     {SYSCALL_SET_ROBUST_LIST,        cvt(&FEXCore::HLE::Set_robust_list),        2},
     {SYSCALL_GET_ROBUST_LIST,        cvt(&FEXCore::HLE::Get_robust_list),        3},
     {SYSCALL_EPOLL_PWAIT,            cvt(&FEXCore::HLE::EPoll_Pwait),            5},
     {SYSCALL_TIMERFD_CREATE,         cvt(&FEXCore::HLE::Timerfd_Create),         2},
+    {SYSCALL_ACCEPT4,                cvt(&FEXCore::HLE::Accept4),                4},
     {SYSCALL_EVENTFD,                cvt(&FEXCore::HLE::Eventfd),                2},
     {SYSCALL_EPOLL_CREATE1,          cvt(&FEXCore::HLE::EPoll_Create1),          1},
     {SYSCALL_DUP3,                   cvt(&FEXCore::HLE::Dup3),                   3},
     {SYSCALL_PIPE2,                  cvt(&FEXCore::HLE::Pipe2),                  2},
     {SYSCALL_INOTIFY_INIT1,          cvt(&FEXCore::HLE::Inotify_init1),          1},
     {SYSCALL_PRLIMIT64,              cvt(&FEXCore::HLE::Prlimit64),              4},
+    {SYSCALL_NAME_TO_HANDLE_AT,      cvt(&FEXCore::HLE::Name_to_handle_at),      5},
+    {SYSCALL_OPEN_BY_HANDLE_AT,      cvt(&FEXCore::HLE::Open_by_handle_at),      3},
     {SYSCALL_SENDMMSG,               cvt(&FEXCore::HLE::Sendmmsg),               4},
     {SYSCALL_SCHED_SETATTR,          cvt(&FEXCore::HLE::Sched_Setattr),          3},
     {SYSCALL_SCHED_GETATTR,          cvt(&FEXCore::HLE::Sched_Getattr),          4},
@@ -906,6 +959,8 @@ uint64_t x64SyscallHandler::HandleSyscall(FEXCore::Core::InternalThreadState *Th
   case 4: return std::invoke(Def.Ptr4, Thread, Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4]);
   case 5: return std::invoke(Def.Ptr5, Thread, Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4], Args->Argument[5]);
   case 6: return std::invoke(Def.Ptr6, Thread, Args->Argument[1], Args->Argument[2], Args->Argument[3], Args->Argument[4], Args->Argument[5], Args->Argument[6]);
+  // for missing syscalls
+  case 255: return std::invoke(Def.Ptr1, Thread, Args->Argument[0]);
   default: break;
   }
 

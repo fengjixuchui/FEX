@@ -23,6 +23,11 @@ namespace FEXCore::HLE {
     SYSCALL_ERRNO();
   }
 
+  uint64_t Fchdir(FEXCore::Core::InternalThreadState *Thread, int fd) {
+    uint64_t Result = ::fchdir(fd);
+    SYSCALL_ERRNO();
+  }
+
   uint64_t Rename(FEXCore::Core::InternalThreadState *Thread, const char *oldpath, const char *newpath) {
     uint64_t Result = ::rename(oldpath, newpath);
     SYSCALL_ERRNO();
@@ -45,6 +50,11 @@ namespace FEXCore::HLE {
 
   uint64_t Unlink(FEXCore::Core::InternalThreadState *Thread, const char *pathname) {
     uint64_t Result = ::unlink(pathname);
+    SYSCALL_ERRNO();
+  }
+
+  uint64_t Symlink(FEXCore::Core::InternalThreadState *Thread, const char *target, const char *linkpath) {
+    uint64_t Result = ::symlink(target, linkpath);
     SYSCALL_ERRNO();
   }
 

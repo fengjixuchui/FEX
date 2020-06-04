@@ -123,22 +123,19 @@ JITCore::JITCore(FEXCore::Context::Context *ctx, FEXCore::Core::InternalThreadSt
   , ThreadState {Thread} {
   Stack.resize(9000 * 16 * 64);
 
-  bool HadRA = CTX->HasRegisterAllocationPass();
-  RAPass = CTX->GetRegisterAllocatorPass();
+  RAPass = Thread->PassManager->GetRAPass();
 
-  if (!HadRA) {
-    RAPass->AllocateRegisterSet(RegisterCount, RegisterClasses);
-    RAPass->AddRegisters(FEXCore::IR::GPRClass, NumGPRs);
-    RAPass->AddRegisters(FEXCore::IR::FPRClass, NumXMMs);
-    RAPass->AddRegisters(FEXCore::IR::GPRPairClass, NumGPRPairs);
+  RAPass->AllocateRegisterSet(RegisterCount, RegisterClasses);
+  RAPass->AddRegisters(FEXCore::IR::GPRClass, NumGPRs);
+  RAPass->AddRegisters(FEXCore::IR::FPRClass, NumXMMs);
+  RAPass->AddRegisters(FEXCore::IR::GPRPairClass, NumGPRPairs);
 
-    RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRClass, NumGPRs);
-    RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRPairClass, NumGPRs);
+  RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRClass, NumGPRs);
+  RAPass->AllocateRegisterConflicts(FEXCore::IR::GPRPairClass, NumGPRs);
 
-    for (uint32_t i = 0; i < NumGPRPairs; ++i) {
-      RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2,     FEXCore::IR::GPRPairClass, i);
-      RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2 + 1, FEXCore::IR::GPRPairClass, i);
-    }
+  for (uint32_t i = 0; i < NumGPRPairs; ++i) {
+    RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2,     FEXCore::IR::GPRPairClass, i);
+    RAPass->AddRegisterConflict(FEXCore::IR::GPRClass, i * 2 + 1, FEXCore::IR::GPRPairClass, i);
   }
 
   CreateCustomDispatch(Thread);
@@ -234,6 +231,10 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
   IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
   auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
   LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
+
+  if (HeaderOp->ShouldInterpret) {
+    return ThreadState->IntBackend->CompileCode(IR, DebugData);
+  }
 
   // Fairly excessive buffer range to make sure we don't overflow
   uint32_t BufferRange = SSACount * 16;
@@ -2373,6 +2374,59 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VADDV: {
+          auto Op = IROp->C<IR::IROp_VAddV>();
+          auto Src = GetSrc(Op->Header.Args[0].ID());
+          auto Dest = GetDst(Node);
+          vpxor(xmm15, xmm15, xmm15);
+          switch (Op->Header.ElementSize) {
+            case 2: {
+              for (int i = 0; i < (Op->Header.Size / 4); ++i) {
+                phaddw(Dest, Src);
+                Src = Dest;
+              }
+              pextrw(eax, Dest, 0);
+              pinsrw(xmm15, eax, 0);
+            break;
+            }
+            case 4: {
+              for (int i = 0; i < (Op->Header.Size / 8); ++i) {
+                phaddd(Dest, Src);
+                Src = Dest;
+              }
+              pextrd(eax, Dest, 0);
+              pinsrd(xmm15, eax, 0);
+            break;
+            }
+            default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+          }
+
+          movaps(Dest, xmm15);
+          break;
+        }
+        case IR::OP_VABS: {
+          auto Op = IROp->C<IR::IROp_VAbs>();
+          switch (Op->Header.ElementSize) {
+            case 1: {
+              vpabsb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            }
+            case 2: {
+              vpabsw(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            }
+            case 4: {
+              vpabsd(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            }
+            case 8: {
+              vpabsq(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            }
+            default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+          }
+          break;
+        }
         case IR::OP_VUMUL:
         case IR::OP_VSMUL: {
           auto Op = IROp->C<IR::IROp_VUMul>();
@@ -4477,6 +4531,22 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
               tzcnt(GetDst<RA_64>(Node), GetSrc<RA_64>(Op->Header.Args[0].ID()));
               break;
             default: LogMan::Msg::A("Unknown size: %d", OpSize); break;
+          }
+          break;
+        }
+        case IR::OP_FENCE: {
+          auto Op = IROp->C<IR::IROp_Fence>();
+          switch (Op->Fence) {
+            case IR::Fence_Load.Val:
+              lfence();
+              break;
+            case IR::Fence_LoadStore.Val:
+              mfence();
+              break;
+            case IR::Fence_Store.Val:
+              sfence();
+              break;
+            default: LogMan::Msg::A("Unknown Fence: %d", Op->Fence); break;
           }
           break;
         }
