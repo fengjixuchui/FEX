@@ -1655,12 +1655,9 @@ void OpDispatchBuilder::BTOp(OpcodeArgs) {
   else {
     // Load the address to the memory location
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1, false);
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
 
     // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+    OrderedNode *BitSelect = _Bfe(3, 0, Src);
 
     // Address is provided as bits we want BYTE offsets
     // Just shift by 3 to get the offset
@@ -1671,7 +1668,7 @@ void OpDispatchBuilder::BTOp(OpcodeArgs) {
 
     // Now add the addresses together and load the memory
     OrderedNode *MemoryLocation = _Add(Dest, Src);
-    Result = _LoadMem(GPRClass, Size, MemoryLocation, Size);
+    Result = _LoadMem(GPRClass, 1, MemoryLocation, 1);
 
     // Now shift in to the correct bit location
     Result = _Lshr(Result, BitSelect);
@@ -1703,12 +1700,9 @@ void OpDispatchBuilder::BTROp(OpcodeArgs) {
   else {
     // Load the address to the memory location
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1, false);
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
 
     // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+    OrderedNode *BitSelect = _Bfe(3, 0, Src);
 
     // Address is provided as bits we want BYTE offsets
     // Just shift by 3 to get the offset
@@ -1719,14 +1713,14 @@ void OpDispatchBuilder::BTROp(OpcodeArgs) {
 
     // Now add the addresses together and load the memory
     OrderedNode *MemoryLocation = _Add(Dest, Src);
-    OrderedNode *Value = _LoadMem(GPRClass, Size, MemoryLocation, Size);
+    OrderedNode *Value = _LoadMem(GPRClass, 1, MemoryLocation, 1);
 
     // Now shift in to the correct bit location
     Result = _Lshr(Value, BitSelect);
     OrderedNode *BitMask = _Lshl(_Constant(1), BitSelect);
     BitMask = _Not(BitMask);
     Value = _And(Value, BitMask);
-    _StoreMem(GPRClass, Size, MemoryLocation, Value, Size);
+    _StoreMem(GPRClass, 1, MemoryLocation, Value, 1);
   }
   SetRFLAG<FEXCore::X86State::RFLAG_CF_LOC>(Result);
 }
@@ -1754,12 +1748,9 @@ void OpDispatchBuilder::BTSOp(OpcodeArgs) {
   else {
     // Load the address to the memory location
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1, false);
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
 
     // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+    OrderedNode *BitSelect = _Bfe(3, 0, Src);
 
     // Address is provided as bits we want BYTE offsets
     // Just shift by 3 to get the offset
@@ -1770,13 +1761,13 @@ void OpDispatchBuilder::BTSOp(OpcodeArgs) {
 
     // Now add the addresses together and load the memory
     OrderedNode *MemoryLocation = _Add(Dest, Src);
-    OrderedNode *Value = _LoadMem(GPRClass, Size, MemoryLocation, Size);
+    OrderedNode *Value = _LoadMem(GPRClass, 1, MemoryLocation, 1);
 
     // Now shift in to the correct bit location
     Result = _Lshr(Value, BitSelect);
     OrderedNode *BitMask = _Lshl(_Constant(1), BitSelect);
     Value = _Or(Value, BitMask);
-    _StoreMem(GPRClass, Size, MemoryLocation, Value, Size);
+    _StoreMem(GPRClass, 1, MemoryLocation, Value, 1);
   }
   SetRFLAG<FEXCore::X86State::RFLAG_CF_LOC>(Result);
 }
@@ -1804,12 +1795,8 @@ void OpDispatchBuilder::BTCOp(OpcodeArgs) {
   else {
     // Load the address to the memory location
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1, false);
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
-
     // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+    OrderedNode *BitSelect = _Bfe(3, 0, Src);
 
     // Address is provided as bits we want BYTE offsets
     // Just shift by 3 to get the offset
@@ -1820,13 +1807,13 @@ void OpDispatchBuilder::BTCOp(OpcodeArgs) {
 
     // Now add the addresses together and load the memory
     OrderedNode *MemoryLocation = _Add(Dest, Src);
-    OrderedNode *Value = _LoadMem(GPRClass, Size, MemoryLocation, Size);
+    OrderedNode *Value = _LoadMem(GPRClass, 1, MemoryLocation, 1);
 
     // Now shift in to the correct bit location
     Result = _Lshr(Value, BitSelect);
     OrderedNode *BitMask = _Lshl(_Constant(1), BitSelect);
     Value = _Xor(Value, BitMask);
-    _StoreMem(GPRClass, Size, MemoryLocation, Value, Size);
+    _StoreMem(GPRClass, 1, MemoryLocation, Value, 1);
   }
   SetRFLAG<FEXCore::X86State::RFLAG_CF_LOC>(Result);
 }
@@ -2041,6 +2028,43 @@ void OpDispatchBuilder::WriteSegmentReg(OpcodeArgs) {
   else {
     _StoreContext(GPRClass, Size, offsetof(FEXCore::Core::CPUState, gs), Src);
   }
+}
+
+void OpDispatchBuilder::EnterOp(OpcodeArgs) {
+  LogMan::Throw::A(Op->Src[0].TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_LITERAL, "Src1 needs to be literal here");
+  uint64_t Value = Op->Src[0].TypeLiteral.Literal;
+
+  uint16_t AllocSpace = Value & 0xFFFF;
+  uint8_t Level = (Value >> 16) & 0x1F;
+
+  auto PushValue = [&](uint8_t Size, OrderedNode *Src) {
+    auto OldSP = _LoadContext(8, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), GPRClass);
+
+    auto NewSP = _Sub(OldSP, _Constant(Size));
+    _StoreMem(GPRClass, Size, NewSP, Src, Size);
+
+    // Store the new stack pointer
+    _StoreContext(GPRClass, 8, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), NewSP);
+    return NewSP;
+  };
+
+  auto OldBP = _LoadContext(8, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RBP]), GPRClass);
+  auto NewSP = PushValue(8, OldBP);
+  auto temp_RBP = NewSP;
+
+  if (Level > 0) {
+    for (uint8_t i = 1; i < Level; ++i) {
+      auto Offset = _Constant(i * 8);
+      auto MemLoc = _Sub(OldBP, Offset);
+      auto Mem = _LoadMem(GPRClass, 8, MemLoc, 8);
+      NewSP = PushValue(8, Mem);
+    }
+    NewSP = PushValue(8, temp_RBP);
+  }
+  NewSP = _Sub(NewSP, _Constant(AllocSpace));
+  _StoreContext(GPRClass, 8, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), NewSP);
+
+  _StoreContext(GPRClass, 8, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RBP]), temp_RBP);
 }
 
 void OpDispatchBuilder::RDTSCOp(OpcodeArgs) {
@@ -6781,6 +6805,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xAE, 2, &OpDispatchBuilder::SCASOp},
     {0xB0, 16, &OpDispatchBuilder::MOVGPROp<0>},
     {0xC2, 2, &OpDispatchBuilder::RETOp},
+    {0xC8, 1, &OpDispatchBuilder::EnterOp},
     {0xC9, 1, &OpDispatchBuilder::LEAVEOp},
     {0xCC, 2, &OpDispatchBuilder::INTOp},
     {0xD7, 2, &OpDispatchBuilder::XLATOp},
@@ -6797,6 +6822,11 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xF5, 1, &OpDispatchBuilder::FLAGControlOp},
     {0xF8, 2, &OpDispatchBuilder::FLAGControlOp},
     {0xFC, 2, &OpDispatchBuilder::FLAGControlOp},
+  };
+
+  const std::vector<std::tuple<uint8_t, uint8_t, X86Tables::OpDispatchPtr>> BaseOpTable_32 = {
+    {0x40, 8, &OpDispatchBuilder::INCOp},
+    {0x48, 8, &OpDispatchBuilder::DECOp},
   };
 
   const std::vector<std::tuple<uint8_t, uint8_t, FEXCore::X86Tables::OpDispatchPtr>> TwoByteOpTable = {
@@ -7725,6 +7755,9 @@ constexpr uint16_t PF_F2 = 3;
   };
 
   InstallToTable(FEXCore::X86Tables::BaseOps, BaseOpTable);
+  if (Mode == Context::MODE_32BIT) {
+    InstallToTable(FEXCore::X86Tables::BaseOps, BaseOpTable_32);
+  }
   InstallToTable(FEXCore::X86Tables::SecondBaseOps, TwoByteOpTable);
   InstallToTable(FEXCore::X86Tables::PrimaryInstGroupOps, PrimaryGroupOpTable);
 
