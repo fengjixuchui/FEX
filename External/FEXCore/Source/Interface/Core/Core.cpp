@@ -19,6 +19,8 @@
 #include <FEXCore/Core/CPUBackend.h>
 #include <FEXCore/Core/X86Enums.h>
 
+#include "Interface/HLE/Thunks/Thunks.h"
+
 #include <fstream>
 #include <unistd.h>
 
@@ -124,7 +126,8 @@ namespace DefaultFallbackCore {
 }
 
 namespace FEXCore::Context {
-  Context::Context() {
+  Context::Context()
+    : SignalDelegation {this} {
     FallbackCPUFactory = FEXCore::Core::DefaultFallbackCore::CPUCreationFactory;
 #ifdef BLOCKSTATS
     BlockData = std::make_unique<FEXCore::BlockSamplingData>();
@@ -228,6 +231,8 @@ namespace FEXCore::Context {
 
   bool Context::InitCore(FEXCore::CodeLoader *Loader) {
     SyscallHandler.reset(FEXCore::CreateHandler(Config.Is64BitMode ? OperatingMode::MODE_64BIT : OperatingMode::MODE_32BIT, this));
+    ThunkHandler.reset(FEXCore::ThunkHandler::Create());
+
     LocalLoader = Loader;
     using namespace FEXCore::Core;
     FEXCore::Core::CPUState NewThreadState{};
@@ -451,6 +456,9 @@ namespace FEXCore::Context {
       break;
     case FEXCore::Config::CONFIG_IRJIT:
       Thread->PassManager->InsertRAPass(IR::CreateRegisterAllocationPass());
+      // Initialization order matters here, the IR JIT may want to have the interpreter created first to get a pointer to its execution function
+      // This is useful for JIT to interpreter fallback support
+      Thread->IntBackend.reset(FEXCore::CPU::CreateInterpreterCore(this));
       Thread->CPUBackend.reset(FEXCore::CPU::CreateJITCore(this, Thread));
       break;
     case FEXCore::Config::CONFIG_LLVMJIT:     Thread->CPUBackend.reset(FEXCore::CPU::CreateLLVMCore(Thread)); break;
@@ -489,7 +497,7 @@ namespace FEXCore::Context {
     Thread->BlockCache->ClearCache();
     Thread->CPUBackend->ClearCache();
     Thread->IntBackend->ClearCache();
-
+  
     if (GuestRIP != 0) {
       auto IR = Thread->IRLists.find(GuestRIP)->second.release();
       Thread->IRLists.clear();
@@ -679,7 +687,10 @@ namespace FEXCore::Context {
 
     // Let's do some initial bookkeeping here
     Thread->State.ThreadManager.TID = ::gettid();
+    SignalDelegation.RegisterTLSState(Thread);
     ++IdleWaitRefCount;
+
+    LogMan::Msg::D("[%d] Waiting to run", Thread->State.ThreadManager.TID.load());
 
     // Now notify the thread that we are initialized
     Thread->ThreadWaiting.NotifyAll();
@@ -689,7 +700,11 @@ namespace FEXCore::Context {
       Thread->StartRunning.Wait();
     }
 
+    LogMan::Msg::D("[%d] Running", Thread->State.ThreadManager.TID.load());
+
     if (ShouldStop.load() || Thread->State.RunningEvents.ShouldStop.load()) {
+      LogMan::Msg::D("[%d] Early exiting", Thread->State.ThreadManager.TID.load());
+
       ShouldStop = true;
       Thread->State.RunningEvents.ShouldStop.store(true);
       Thread->State.RunningEvents.Running.store(false);
@@ -714,14 +729,6 @@ namespace FEXCore::Context {
     }
 
     uint64_t InitializationStep = 0;
-    if (Initializing) {
-      Thread->State.State.rip = ~0ULL;
-    }
-    else {
-      if (Thread->State.ThreadManager.GetTID() == 1) {
-        Thread->State.State.rip = StartingRIP;
-      }
-    }
 
     if (Thread->CPUBackend->HasCustomDispatch()) {
       Thread->CPUBackend->ExecuteCustomDispatch(&Thread->State);
@@ -745,8 +752,8 @@ namespace FEXCore::Context {
         uint64_t GuestRIP = Thread->State.State.rip;
 
         if (CoreDebugLevel >= 1) {
-          char const *Name = LocalLoader->FindSymbolNameInRange(GuestRIP - MemoryBase);
-          LogMan::Msg::D(">>>>RIP: 0x%lx(0x%lx): '%s'", GuestRIP, GuestRIP - MemoryBase, Name ? Name : "<Unknown>");
+          char const *Name = LocalLoader->FindSymbolNameInRange(GuestRIP);
+          LogMan::Msg::D("[%d:%d] >>>>RIP: 0x%lx(0x%lx): '%s'", ::getpid(), ::gettid(), GuestRIP, GuestRIP - MemoryBase, Name ? Name : "<Unknown>");
         }
 
         if (!Thread->CPUBackend->NeedsOpDispatch()) {
@@ -822,15 +829,7 @@ namespace FEXCore::Context {
         }
 
         if (Thread->State.RunningEvents.ShouldStop.load()) {
-          // If it is the parent thread that died then just leave
-          // XXX: This doesn't make sense when the parent thread doesn't outlive its children
-          if (Thread->State.ThreadManager.parent_tid == 0) {
-            ShouldStop = true;
-            Thread->ExitReason = FEXCore::Context::ExitReason::EXIT_SHUTDOWN;
-          }
-
-          --IdleWaitRefCount;
-          IdleWaitCV.notify_all();
+          LogMan::Msg::D("[%d] Thread Event Should Stop", Thread->State.ThreadManager.TID.load());
           break;
         }
 
@@ -859,6 +858,17 @@ namespace FEXCore::Context {
         }
       }
     }
+
+    // If it is the parent thread that died then just leave
+    // XXX: This doesn't make sense when the parent thread doesn't outlive its children
+    if (Thread->State.ThreadManager.parent_tid == 0) {
+      LogMan::Msg::D("[%d] Thread Event Everything should stop", Thread->State.ThreadManager.TID.load());
+      ShouldStop = true;
+      Thread->ExitReason = FEXCore::Context::ExitReason::EXIT_SHUTDOWN;
+    }
+
+    --IdleWaitRefCount;
+    IdleWaitCV.notify_all();
 
     Thread->State.RunningEvents.WaitingToStart = false;
     Thread->State.RunningEvents.Running = false;

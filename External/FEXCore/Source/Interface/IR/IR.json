@@ -123,6 +123,11 @@
       ]
     },
 
+    "SignalReturn": {
+      "HasSideEffects": true,
+      "OpClass": "Branch"
+    },
+
     "CASPair": {
       "HasSideEffects": true,
       "OpClass": "Atomic",
@@ -480,6 +485,19 @@
         "Arg3",
         "Arg4",
         "Arg5"
+      ]
+    },
+
+    "Thunk": {
+      "HasSideEffects": true,
+      "OpClass": "Branch",
+      "SSAArgs": "1",
+      "SSANames": [
+        "ArgPtr"
+      ],
+      "Args":[
+        "const char*", "ThunkName",
+        "uintptr_t", "ThunkFnPtr"
       ]
     },
 
@@ -1526,6 +1544,24 @@
       "SSAArgs": "1",
       "SSANames": [
         "Vector"
+      ],
+      "HelperArgs": [
+        "uint8_t", "RegisterSize",
+        "uint8_t", "ElementSize"
+      ]
+    },
+
+    "VURAvg": {
+      "OpClass": "Vector",
+      "Desc": ["Does an unsigned rounded average", "dst_elem = (src1_elem + src2_elem + 1) >> 1"],
+      "HasDest": true,
+      "DestClass": "FPR",
+      "DestSize": "RegisterSize",
+      "NumElements": "RegisterSize / ElementSize",
+      "SSAArgs": "2",
+      "SSANames": [
+        "Vector1",
+        "Vector2"
       ],
       "HelperArgs": [
         "uint8_t", "RegisterSize",

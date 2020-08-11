@@ -66,15 +66,25 @@ namespace FEX::ArgLoader {
     }
     {
       Parser.set_defaults("RootFS", "");
+      Parser.set_defaults("ThunkLibs", "");
 
       EmulationGroup.add_option("-R", "--rootfs")
         .dest("RootFS")
         .help("Which Root filesystem prefix to use");
 
+      EmulationGroup.add_option("-t", "--thunklibs")
+        .dest("ThunkLibs")
+        .help("Folder to find the host-side thunking libs");
+
       EmulationGroup.add_option("-U", "--unified-memory")
         .dest("UnifiedMemory")
         .action("store_true")
         .help("Enable unified memory for the emulator");
+
+      EmulationGroup.add_option("-E", "--env")
+        .dest("Env")
+        .help("Adds an environment variable")
+        .action("append");
 
       Parser.add_option_group(EmulationGroup);
     }
@@ -111,9 +121,14 @@ namespace FEX::ArgLoader {
           .help("Disable logging")
           .action("store_true");
 
+      LoggingGroup.add_option("-o", "--output-log")
+          .dest("OutputLog")
+          .help("File to write FEX output to [stdout, stderr, <Filename>]")
+          .set_default("stderr");
+
       Parser.add_option_group(LoggingGroup);
     }
-      
+
     optparse::Values Options = Parser.parse_args(argc, argv);
 
     {
@@ -172,9 +187,20 @@ namespace FEX::ArgLoader {
         Config::Add("RootFS", Option);
       }
 
+      if (Options.is_set_by_user("ThunkLibs")) {
+        std::string Option = Options["ThunkLibs"];
+        Config::Add("ThunkLibs", Option);
+      }
+
       if (Options.is_set_by_user("UnifiedMemory")) {
         bool Option = Options.get("UnifiedMemory");
         Config::Add("UnifiedMemory", std::to_string(Option));
+      }
+
+      if (Options.is_set_by_user("Env")) {
+        for (auto iter = Options.all("Env").begin(); iter != Options.all("Env").end(); ++iter) {
+          Config::Append("Env", *iter);
+        }
       }
     }
 
@@ -203,6 +229,11 @@ namespace FEX::ArgLoader {
       if (Options.is_set_by_user("SilentLog")) {
         bool SilentLog = Options.get("SilentLog");
         Config::Add("SilentLog", std::to_string(SilentLog));
+      }
+
+      if (Options.is_set_by_user("OutputLog")) {
+        std::string OutputLog = Options["OutputLog"];
+        Config::Add("OutputLog", OutputLog);
       }
     }
 

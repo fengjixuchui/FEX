@@ -14,9 +14,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
+namespace {
 static bool SilentLog;
+static FILE *OutputFD {stdout};
 
 void MsgHandler(LogMan::DebugLevels Level, char const *Message) {
   const char *CharLevel{nullptr};
@@ -49,15 +52,15 @@ void MsgHandler(LogMan::DebugLevels Level, char const *Message) {
   }
 
   if (!SilentLog) {
-    printf("[%s] %s\n", CharLevel, Message);
-    fflush(nullptr);
+    fprintf(OutputFD, "[%s] %s\n", CharLevel, Message);
+    fflush(OutputFD);
   }
 }
 
 void AssertHandler(char const *Message) {
   if (!SilentLog) {
-    printf("[ASSERT] %s\n", Message);
-    fflush(nullptr);
+    fprintf(OutputFD, "[ASSERT] %s\n", Message);
+    fflush(OutputFD);
   }
 }
 
@@ -78,6 +81,7 @@ bool CheckMemMapping() {
 
   fs.close();
   return true;
+}
 }
 
 int main(int argc, char **argv, char **const envp) {
@@ -101,16 +105,32 @@ int main(int argc, char **argv, char **const envp) {
   FEX::Config::Value<uint64_t> ThreadsConfig{"Threads", 1};
   FEX::Config::Value<bool> UnifiedMemory{"UnifiedMemory", true};
   FEX::Config::Value<std::string> LDPath{"RootFS", ""};
+  FEX::Config::Value<std::string> ThunkLibsPath{"ThunkLibs", ""};
   FEX::Config::Value<bool> SilentLog{"SilentLog", false};
+  FEX::Config::Value<std::string> Environment{"Env", ""};
+  FEX::Config::Value<std::string> OutputLog{"OutputLog", "stderr"};
 
   ::SilentLog = SilentLog();
+
+  if (!::SilentLog) {
+    auto LogFile = OutputLog();
+    if (LogFile == "stderr") {
+      OutputFD = stderr;
+    }
+    else if (LogFile == "stdout") {
+      OutputFD = stdout;
+    }
+    else if (!LogFile.empty()) {
+      OutputFD = fopen(LogFile.c_str(), "wb");
+    }
+  }
 
   auto Args = FEX::ArgLoader::Get();
   auto ParsedArgs = FEX::ArgLoader::GetParsedArgs();
 
   LogMan::Throw::A(!Args.empty(), "Not enough arguments");
 
-  FEX::HarnessHelper::ELFCodeLoader Loader{Args[0], LDPath(), Args, ParsedArgs, envp};
+  FEX::HarnessHelper::ELFCodeLoader Loader{Args[0], LDPath(), Args, ParsedArgs, envp, &Environment};
 
   FEXCore::Context::InitializeStaticTables(Loader.Is64BitMode() ? FEXCore::Context::MODE_64BIT : FEXCore::Context::MODE_32BIT);
   uint64_t VMemSize = 1ULL << 36;
@@ -128,6 +148,7 @@ int main(int argc, char **argv, char **const envp) {
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_MAXBLOCKINST, BlockSizeConfig());
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_GDBSERVER, GdbServerConfig());
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_ROOTFSPATH, LDPath());
+  FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_THUNKLIBSPATH, ThunkLibsPath());
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_UNIFIED_MEMORY, UnifiedMemory());
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode());
   FEXCore::Config::SetConfig(CTX, FEXCore::Config::CONFIG_EMULATED_CPU_CORES, ThreadsConfig());
@@ -163,6 +184,12 @@ int main(int argc, char **argv, char **const envp) {
   LogMan::Msg::D("Managed to load? %s", Result ? "Yes" : "No");
 
   FEX::Config::Shutdown();
+
+  if (OutputFD != stderr &&
+      OutputFD != stdout &&
+      OutputFD != nullptr) {
+    fclose(OutputFD);
+  }
 
   if (ShutdownReason == FEXCore::Context::ExitReason::EXIT_SHUTDOWN) {
     return ProgramStatus;

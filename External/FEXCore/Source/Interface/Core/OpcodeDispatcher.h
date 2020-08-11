@@ -100,9 +100,11 @@ public:
   void ALUOp(OpcodeArgs);
   void INTOp(OpcodeArgs);
   void SyscallOp(OpcodeArgs);
+  void ThunkOp(OpcodeArgs);
   void LEAOp(OpcodeArgs);
   void NOPOp(OpcodeArgs);
   void RETOp(OpcodeArgs);
+  void SIGRETOp(OpcodeArgs);
   template<uint32_t SrcIndex>
   void SecondaryALUOp(OpcodeArgs);
   template<uint32_t SrcIndex>
@@ -134,6 +136,7 @@ public:
   void XCHGOp(OpcodeArgs);
   void SAHFOp(OpcodeArgs);
   void LAHFOp(OpcodeArgs);
+  template<bool ToSeg>
   void MOVSegOp(OpcodeArgs);
   void FLAGControlOp(OpcodeArgs);
   void MOVOffsetOp(OpcodeArgs);
@@ -257,6 +260,8 @@ public:
   void PSLLDQ(OpcodeArgs);
   template<size_t ElementSize>
   void PSRAIOp(OpcodeArgs);
+  template<size_t ElementSize>
+  void PAVGOp(OpcodeArgs);
   void MOVDDUPOp(OpcodeArgs);
   template<size_t DstElementSize, bool Signed>
   void CVTGPR_To_FPR(OpcodeArgs);
@@ -427,8 +432,8 @@ private:
 
   void GenerateFlags_ADC(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2, OrderedNode *CF);
   void GenerateFlags_SBB(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2, OrderedNode *CF);
-  void GenerateFlags_SUB(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2);
-  void GenerateFlags_ADD(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2);
+  void GenerateFlags_SUB(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2, bool UpdateCF = true);
+  void GenerateFlags_ADD(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2, bool UpdateCF = true);
   void GenerateFlags_MUL(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *High);
   void GenerateFlags_UMUL(FEXCore::X86Tables::DecodedOp Op, OrderedNode *High);
   void GenerateFlags_Logical(FEXCore::X86Tables::DecodedOp Op, OrderedNode *Res, OrderedNode *Src1, OrderedNode *Src2);

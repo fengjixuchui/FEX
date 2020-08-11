@@ -11,6 +11,8 @@
 #include <FEXCore/IR/IR.h>
 #include <FEXCore/IR/IntrusiveIRList.h>
 
+#include "Interface/HLE/Thunks/Thunks.h"
+
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -246,6 +248,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
             uint64_t Res = FEXCore::HandleSyscall(CTX->SyscallHandler.get(), Thread, &Args);
             GD = Res;
+            break;
+          }
+          case IR::OP_THUNK: {
+            auto Op = IROp->C<IR::IROp_Thunk>();
+
+            //LogMan::Msg::D("Thunk function: %s, %p, %p\n", Op->ThunkName, Op->ThunkFnPtr, *GetSrc<void**>(Op->Header.Args[0]));
+
+            reinterpret_cast<ThunkedFunction*>(Op->ThunkFnPtr)(CTX, *GetSrc<void**>(Op->Header.Args[0]));
+
             break;
           }
           case IR::OP_CPUID: {
@@ -2537,6 +2548,23 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
             }
             memcpy(GDP, Tmp, Op->Header.ElementSize);
+            break;
+          }
+          case IR::OP_VURAVG: {
+            auto Op = IROp->C<IR::IROp_VURAvg>();
+            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            uint8_t Tmp[16];
+
+            uint8_t Elements = OpSize / Op->Header.ElementSize;
+
+            auto Func = [](auto a, auto b) { return (a + b + 1) >> 1; };
+            switch (Op->Header.ElementSize) {
+              DO_VECTOR_OP(1, uint8_t,  Func)
+              DO_VECTOR_OP(2, uint16_t, Func)
+              default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+            }
+            memcpy(GDP, Tmp, OpSize);
             break;
           }
           case IR::OP_VABS: {

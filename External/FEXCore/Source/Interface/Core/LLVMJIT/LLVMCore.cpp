@@ -106,6 +106,7 @@ private:
 
   struct LLVMCurrentState {
     llvm::Function *SyscallFunction;
+    llvm::Function *ThunkFunction;
     llvm::Function *CPUIDFunction;
     llvm::Function *ExitVMFunction;
     llvm::Function *ValuePrinter;
@@ -626,6 +627,34 @@ private:
     return Result;
   }
 
+  llvm::Value *VURAVG(llvm::Value *Arg1, llvm::Value *Arg2, uint8_t RegisterSize, uint8_t ElementSize) {
+
+    uint8_t NumElements = RegisterSize / ElementSize;
+
+    // Cast to the type we want
+    llvm::Value *Result = llvm::UndefValue::get(Arg1->getType());
+
+    for (size_t i = 0; i < NumElements; ++i) {
+
+      // get args, zext to ElementSize * 2
+      auto Src1 = JITState.IRBuilder->CreateZExt(JITState.IRBuilder->CreateExtractElement(Arg1, i), llvm::Type::getIntNTy(*Con, ElementSize * 2 * 8));
+      auto Src2 = JITState.IRBuilder->CreateZExt(JITState.IRBuilder->CreateExtractElement(Arg2, i), llvm::Type::getIntNTy(*Con, ElementSize * 2 * 8));
+
+      // Add Src1 + Src2 + 1
+      auto Sum = JITState.IRBuilder->CreateAdd(Src1, Src2);
+      Sum = JITState.IRBuilder->CreateAdd(Sum, JITState.IRBuilder->getIntN(ElementSize * 2 * 8, 1));
+      
+      // Shift left and trunc to ElementSize
+      auto Avg = JITState.IRBuilder->CreateLShr(Sum, JITState.IRBuilder->getIntN(ElementSize * 2 * 8, 1));
+      Avg = JITState.IRBuilder->CreateTrunc(Avg, llvm::Type::getIntNTy(*Con, ElementSize * 8));
+
+      // Insert in the dst vector
+      Result = JITState.IRBuilder->CreateInsertElement(Result, Avg, i);
+    }
+
+    return Result;
+  }
+
   llvm::Value *VADDV(llvm::Value *Arg, uint8_t RegisterSize, uint8_t ElementSize) {
     uint8_t NumElements = RegisterSize / ElementSize;
     std::vector<llvm::Value*> Values;
@@ -963,6 +992,31 @@ void LLVMJITCore::CreateGlobalVariables(llvm::ExecutionEngine *Engine, llvm::Mod
     Engine->addGlobalMapping(JITCurrentState.SyscallFunction, Ptr.Data);
   }
 
+  // Thunk Function
+  {
+    auto FuncType = FunctionType::get(voidTy,
+      {
+        i64, // Technically a this pointer
+        i64, // Technically a this pointer
+        i64, // Technically a this pointer
+      },
+      false);
+    JITCurrentState.ThunkFunction = Function::Create(FuncType,
+      Function::ExternalLinkage,
+      "ThunkCaller",
+      FunctionModule);
+    using ClassPtrType = void (*)(void (*)(void*, void*), void*, void*);
+    union PtrCast {
+      ClassPtrType ClassPtr;
+      void* Data;
+    };
+    PtrCast Ptr;
+    Ptr.ClassPtr = [](void(*fn)(void*, void*), void* ctx, void* args) {
+      fn(ctx, args); 
+    };
+    Engine->addGlobalMapping(JITCurrentState.ThunkFunction, Ptr.Data);
+  }
+
   // CPUID Function
   {
     auto FuncType = FunctionType::get(i128,
@@ -1267,8 +1321,13 @@ void LLVMJITCore::CreateGlobalVariables(llvm::ExecutionEngine *Engine, llvm::Mod
         ArrayType::get(i64, 16), // Gregs
         i64, // Pad to ensure alignment
         ArrayType::get(i128, 16), // XMMs
+        i16, // es
+        i16, // cs
+        i16, // ss
+        i16, // ds
         i64, i64, // GS, FS
         ArrayType::get(i8, 48), //rflags
+        i64, // Pad to ensure alignment
         ArrayType::get(i128, 8), // MMs
       },
       "CPUStateType");
@@ -1303,17 +1362,33 @@ llvm::Value *LLVMJITCore::CreateContextGEP(uint64_t Offset, uint8_t Size) {
     GEPValues.emplace_back(JITState.IRBuilder->getInt32(3));
     GEPValues.emplace_back(JITState.IRBuilder->getInt32((Offset - offsetof(FEXCore::Core::CPUState, xmm)) / 16));
   }
+  else if (Offset == offsetof(FEXCore::Core::CPUState, es)) {
+    if (Size != 2) return nullptr;
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(4));
+  }
+  else if (Offset == offsetof(FEXCore::Core::CPUState, cs)) {
+    if (Size != 2) return nullptr;
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(5));
+  }
+  else if (Offset == offsetof(FEXCore::Core::CPUState, ss)) {
+    if (Size != 2) return nullptr;
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(6));
+  }
+  else if (Offset == offsetof(FEXCore::Core::CPUState, ds)) {
+    if (Size != 2) return nullptr;
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(7));
+  }
   else if (Offset == offsetof(FEXCore::Core::CPUState, gs)) {
     if (Size != 8) return nullptr;
-    GEPValues.emplace_back(JITState.IRBuilder->getInt32(4));
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(8));
   }
   else if (Offset == offsetof(FEXCore::Core::CPUState, fs)) {
     if (Size != 8) return nullptr;
-    GEPValues.emplace_back(JITState.IRBuilder->getInt32(5));
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(9));
   }
   else if (Offset >= offsetof(FEXCore::Core::CPUState, flags)) {
     if (Size != 1) return nullptr;
-    GEPValues.emplace_back(JITState.IRBuilder->getInt32(6));
+    GEPValues.emplace_back(JITState.IRBuilder->getInt32(10));
     GEPValues.emplace_back(JITState.IRBuilder->getInt32(Offset - offsetof(FEXCore::Core::CPUState, flags[0])));
   }
   else
@@ -1637,6 +1712,17 @@ void LLVMJITCore::HandleIR(FEXCore::IR::IRListView<true> const *IR, IR::NodeWrap
       auto Result = JITState.IRBuilder->CreateCall(JITCurrentState.SyscallFunction, Args);
       SetDest(*WrapperOp, Result);
     break;
+    }
+    case IR::OP_THUNK: {
+      auto Op = IROp->C<IR::IROp_Thunk>();
+      std::vector<llvm::Value*> Args{};
+
+      Args.emplace_back(JITState.IRBuilder->getInt64(Op->ThunkFnPtr)); // function to call
+      Args.emplace_back(JITState.IRBuilder->getInt64(reinterpret_cast<uint64_t>(CTX))); // context
+      Args.emplace_back(GetSrc(Op->Header.Args[0])); // params
+
+      JITState.IRBuilder->CreateCall(JITCurrentState.ThunkFunction, Args);
+      break;
     }
     case IR::OP_CPUID: {
       auto Op = IROp->C<IR::IROp_CPUID>();
@@ -2668,6 +2754,20 @@ void LLVMJITCore::HandleIR(FEXCore::IR::IRListView<true> const *IR, IR::NodeWrap
       Src2 = CastVectorToType(Src2, true, OpSize, Op->Header.ElementSize);
 
       auto Result = VADDP(Src1, Src2, OpSize, Op->Header.ElementSize);
+
+      SetDest(*WrapperOp, Result);
+    break;
+    }
+    case IR::OP_VURAVG: {
+      auto Op = IROp->C<IR::IROp_VURAvg>();
+      auto Src1 = GetSrc(Op->Header.Args[0]);
+      auto Src2 = GetSrc(Op->Header.Args[1]);
+
+      // Cast to the type we want
+      Src1 = CastVectorToType(Src1, true, OpSize, Op->Header.ElementSize);
+      Src2 = CastVectorToType(Src2, true, OpSize, Op->Header.ElementSize);
+
+      auto Result = VURAVG(Src1, Src2, OpSize, Op->Header.ElementSize);
 
       SetDest(*WrapperOp, Result);
     break;

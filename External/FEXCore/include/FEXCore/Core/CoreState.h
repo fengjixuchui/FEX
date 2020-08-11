@@ -11,9 +11,11 @@ namespace FEXCore::Core {
     uint64_t gregs[16];
     uint64_t : 64;
     uint64_t xmm[16][2];
+    uint16_t es, cs, ss, ds;
     uint64_t gs;
     uint64_t fs;
     uint8_t flags[48];
+    uint64_t : 64; // Ensures mm is aligned
     uint64_t mm[8][2];
 
     // 32bit x86 state

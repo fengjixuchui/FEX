@@ -2006,6 +2006,33 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           mov (GetDst<RA_64>(Node), rax);
           break;
         }
+        case IR::OP_THUNK: {
+          auto Op = IROp->C<IR::IROp_Thunk>();
+
+          auto NumPush = 1 + RA64.size();
+          push(rdi);
+
+          for (auto &Reg : RA64)
+            push(Reg);
+
+          if (NumPush & 1)
+            sub(rsp, 8); // Align
+          
+          mov(rdi, reinterpret_cast<uintptr_t>(CTX));
+          mov(rsi, GetSrc<RA_64>(Op->Header.Args[0].ID()));
+
+          mov(rax, reinterpret_cast<uintptr_t>(Op->ThunkFnPtr));
+          call(rax);
+
+          if (NumPush & 1)
+            add(rsp, 8); // Align
+          
+          for (uint32_t i = RA64.size(); i > 0; --i)
+            pop(RA64[i - 1]);
+
+          pop(rdi);
+          break;
+        }
         case IR::OP_VEXTRACTTOGPR: {
           auto Op = IROp->C<IR::IROp_VExtractToGPR>();
 
@@ -2402,6 +2429,21 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
 
           movaps(Dest, xmm15);
+          break;
+        }
+        case IR::OP_VURAVG: {
+          auto Op = IROp->C<IR::IROp_VURAvg>();
+          switch (Op->Header.ElementSize) {
+          case 1: {
+            vpavgb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()));
+          break;
+          }
+          case 2: {
+            vpavgw(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()));
+          break;
+          }
+          default: LogMan::Msg::A("Unknown Element Size: %d", Op->Header.ElementSize); break;
+          }
           break;
         }
         case IR::OP_VABS: {
@@ -4095,22 +4137,25 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
             mov(MemReg, Memory);
             add(MemReg, GetSrc<RA_64>(Op->Header.Args[0].ID()));
           }
-          lock();
           switch (Op->Size) {
           case 1:
             mov(GetDst<RA_8>(Node), GetSrc<RA_8>(Op->Header.Args[1].ID()));
+            lock();
             xchg(byte [MemReg], GetDst<RA_8>(Node));
           break;
           case 2:
             mov(GetDst<RA_16>(Node), GetSrc<RA_16>(Op->Header.Args[1].ID()));
+            lock();
             xchg(word [MemReg], GetDst<RA_8>(Node));
           break;
           case 4:
             mov(GetDst<RA_32>(Node), GetSrc<RA_32>(Op->Header.Args[1].ID()));
+            lock();
             xchg(dword [MemReg], GetDst<RA_8>(Node));
           break;
           case 8:
             mov(GetDst<RA_64>(Node), GetSrc<RA_64>(Op->Header.Args[1].ID()));
+            lock();
             xchg(qword [MemReg], GetDst<RA_8>(Node));
           break;
           default:  LogMan::Msg::A("Unhandled AtomicAdd size: %d", Op->Size);

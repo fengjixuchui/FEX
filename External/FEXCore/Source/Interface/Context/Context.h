@@ -3,6 +3,8 @@
 #include "Interface/Core/CPUID.h"
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/InternalThreadState.h"
+#include "Interface/Core/SignalDelegator.h"
+#include "Interface/Core/X86HelperGen.h"
 #include "Interface/HLE/Syscalls.h"
 #include "Interface/Memory/MemMapper.h"
 #include "Interface/IR/PassManager.h"
@@ -16,6 +18,7 @@
 
 namespace FEXCore {
 class SyscallHandler;
+class ThunkHandler;
 class BlockSamplingData;
 class GdbServer;
 
@@ -51,6 +54,7 @@ namespace FEXCore::Context {
       bool GdbServer {false};
       bool UnifiedMemory {true};
       std::string RootFSPath;
+      std::string ThunkLibsPath;
 
       bool Is64BitMode {true};
       uint64_t EmulatedCPUCores{1};
@@ -79,15 +83,18 @@ namespace FEXCore::Context {
 
     FEXCore::CPUIDEmu CPUID;
     std::unique_ptr<FEXCore::SyscallHandler> SyscallHandler;
+    std::unique_ptr<FEXCore::ThunkHandler> ThunkHandler;
+
     CustomCPUFactoryType CustomCPUFactory;
     CustomCPUFactoryType FallbackCPUFactory;
     std::function<void(uint64_t ThreadId, FEXCore::Context::ExitReason)> CustomExitHandler;
 
-
-
 #ifdef BLOCKSTATS
     std::unique_ptr<FEXCore::BlockSamplingData> BlockData;
 #endif
+
+    SignalDelegator SignalDelegation;
+    X86GeneratedCode X86CodeGen;
 
     Context();
     ~Context();
@@ -161,6 +168,5 @@ namespace FEXCore::Context {
 #if ENABLE_JITSYMBOLS
     FEXCore::JITSymbols Symbols;
 #endif
-
   };
 }
