@@ -9,6 +9,9 @@ option(ENABLE_LLD "Enable linking with LLD" FALSE)
 option(ENABLE_ASAN "Enables Clang ASAN" FALSE)
 option(ENABLE_TSAN "Enables Clang TSAN" FALSE)
 
+set (X86_C_COMPILER "x86_64-linux-gnu-gcc" CACHE STRING "c compiler for compiling x86 guest libs")
+set (X86_CXX_COMPILER "x86_64-linux-gnu-g++" CACHE STRING "c++ compiler for compiling x86 guest libs")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/Bin)
@@ -22,6 +25,12 @@ if (ENABLE_LTO)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 else()
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+endif()
+
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+  message(STATUS "CCache enabled")
+  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
 endif()
 
 if (ENABLE_XRAY)
@@ -54,13 +63,15 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcx16")
 endif()
 
-if (FORCE_AARCH64 OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
   set(_M_ARM_64 1)
-endif()
-
-if (FORCE_AARCH64 OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
   add_subdirectory(External/vixl/)
   include_directories(External/vixl/src/)
+endif()
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  # This means we were attempted to get compiled with GCC
+  message(FATAL_ERROR "FEX doesn't support getting compiled with GCC!")
 endif()
 
 add_definitions(-Wno-trigraphs)
@@ -127,7 +138,7 @@ include(ExternalProject)
 ExternalProject_Add(host-libs
 	PREFIX host-libs
 	SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/HostLibs"
-	BINARY_DIR "Host"
+  BINARY_DIR "Host"
 	INSTALL_COMMAND ""
   BUILD_ALWAYS ON
 )
@@ -135,7 +146,8 @@ ExternalProject_Add(host-libs
 ExternalProject_Add(guest-libs
 	PREFIX guest-libs
 	SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ThunkLibs/GuestLibs"
-	BINARY_DIR "Guest"
+  BINARY_DIR "Guest"
+  CMAKE_ARGS "-DX86_C_COMPILER:STRING=${X86_C_COMPILER}" "-DX86_CXX_COMPILER:STRING=${X86_CXX_COMPILER}"
 	INSTALL_COMMAND ""
   BUILD_ALWAYS ON
 )

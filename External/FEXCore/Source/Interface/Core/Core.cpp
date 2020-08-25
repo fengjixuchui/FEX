@@ -9,7 +9,6 @@
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/Interpreter/InterpreterCore.h"
 #include "Interface/Core/JIT/JITCore.h"
-#include "Interface/Core/LLVMJIT/LLVMCore.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Interface/IR/Passes.h"
 
@@ -126,8 +125,7 @@ namespace DefaultFallbackCore {
 }
 
 namespace FEXCore::Context {
-  Context::Context()
-    : SignalDelegation {this} {
+  Context::Context() {
     FallbackCPUFactory = FEXCore::Core::DefaultFallbackCore::CPUCreationFactory;
 #ifdef BLOCKSTATS
     BlockData = std::make_unique<FEXCore::BlockSamplingData>();
@@ -461,7 +459,6 @@ namespace FEXCore::Context {
       Thread->IntBackend.reset(FEXCore::CPU::CreateInterpreterCore(this));
       Thread->CPUBackend.reset(FEXCore::CPU::CreateJITCore(this, Thread));
       break;
-    case FEXCore::Config::CONFIG_LLVMJIT:     Thread->CPUBackend.reset(FEXCore::CPU::CreateLLVMCore(Thread)); break;
     case FEXCore::Config::CONFIG_CUSTOM:      Thread->CPUBackend.reset(CustomCPUFactory(this, &Thread->State)); break;
     default: LogMan::Msg::A("Unknown core configuration");
     }
@@ -869,6 +866,8 @@ namespace FEXCore::Context {
 
     --IdleWaitRefCount;
     IdleWaitCV.notify_all();
+
+    SignalDelegation.UninstallTLSState(Thread);
 
     Thread->State.RunningEvents.WaitingToStart = false;
     Thread->State.RunningEvents.Running = false;

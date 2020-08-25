@@ -1828,7 +1828,8 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           mov (Dst, rax);
           break;
         }
-        case IR::OP_LOADMEM: {
+        case IR::OP_LOADMEM:
+        case IR::OP_LOADMEMTSO: {
           auto Op = IROp->C<IR::IROp_LoadMem>();
           uint64_t Memory = CTX->MemoryMapper.GetBaseOffset<uint64_t>(0);
 
@@ -1899,7 +1900,8 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
-        case IR::OP_STOREMEM: {
+        case IR::OP_STOREMEM:
+        case IR::OP_STOREMEMTSO: {
           auto Op = IROp->C<IR::IROp_StoreMem>();
           uint64_t Memory = CTX->MemoryMapper.GetBaseOffset<uint64_t>(0);
 
@@ -4131,7 +4133,7 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
 
           Xbyak::Reg MemReg = rax;
           if (CTX->Config.UnifiedMemory) {
-            MemReg = GetSrc<RA_64>(Op->Header.Args[0].ID());
+            mov(MemReg, GetSrc<RA_64>(Op->Header.Args[0].ID()));
           }
           else {
             mov(MemReg, Memory);
@@ -4146,17 +4148,17 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           case 2:
             mov(GetDst<RA_16>(Node), GetSrc<RA_16>(Op->Header.Args[1].ID()));
             lock();
-            xchg(word [MemReg], GetDst<RA_8>(Node));
+            xchg(word [MemReg], GetDst<RA_16>(Node));
           break;
           case 4:
             mov(GetDst<RA_32>(Node), GetSrc<RA_32>(Op->Header.Args[1].ID()));
             lock();
-            xchg(dword [MemReg], GetDst<RA_8>(Node));
+            xchg(dword [MemReg], GetDst<RA_32>(Node));
           break;
           case 8:
             mov(GetDst<RA_64>(Node), GetSrc<RA_64>(Op->Header.Args[1].ID()));
             lock();
-            xchg(qword [MemReg], GetDst<RA_8>(Node));
+            xchg(qword [MemReg], GetDst<RA_64>(Node));
           break;
           default:  LogMan::Msg::A("Unhandled AtomicAdd size: %d", Op->Size);
           }
