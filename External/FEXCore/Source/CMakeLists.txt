@@ -178,9 +178,17 @@ set (SRCS
   Interface/IR/Passes/ValueDominanceValidation.cpp
   Interface/IR/Passes/PhiValidation.cpp
   Interface/IR/Passes/RedundantFlagCalculationElimination.cpp
+  Interface/IR/Passes/DeadFlagStoreElimination.cpp
   Interface/IR/Passes/RegisterAllocationPass.cpp
   Interface/IR/Passes/SyscallOptimization.cpp
   )
+
+if (_M_X86_64)
+  list(APPEND SRCS Interface/Core/Interpreter/x86_64Dispatcher.cpp)
+endif()
+if(_M_ARM_64)
+  list(APPEND SRCS Interface/Core/Interpreter/Arm64Dispatcher.cpp)
+endif()
 
 set (JIT_LIBS )
 if (ENABLE_JIT)

@@ -427,7 +427,32 @@ DEF_OP(LoadMemTSO) {
     MemSrc = MemOperand(TMP1);
   }
 
-  if (Op->Class == FEXCore::IR::GPRClass) {
+  if (SupportsRCPC && Op->Class == FEXCore::IR::GPRClass) {
+    if (Op->Size == 1) {
+      // 8bit load is always aligned to natural alignment
+      auto Dst = GetReg<RA_64>(Node);
+      ldaprb(Dst, MemSrc);
+    }
+    else {
+      // Aligned
+      auto Dst = GetReg<RA_64>(Node);
+      nop();
+      switch (Op->Size) {
+        case 2:
+          ldaprh(Dst, MemSrc);
+          break;
+        case 4:
+          ldapr(Dst.W(), MemSrc);
+          break;
+        case 8:
+          ldapr(Dst, MemSrc);
+          break;
+        default:  LogMan::Msg::A("Unhandled LoadMem size: %d", Op->Size);
+      }
+      nop();
+    }
+  }
+  else if (Op->Class == FEXCore::IR::GPRClass) {
     if (Op->Size == 1) {
       // 8bit load is always aligned to natural alignment
       auto Dst = GetReg<RA_64>(Node);
@@ -601,8 +626,14 @@ void JITCore::RegisterMemoryHandlers() {
   REGISTER_OP(STOREFLAG,           StoreFlag);
   REGISTER_OP(LOADMEM,             LoadMem);
   REGISTER_OP(STOREMEM,            StoreMem);
-  REGISTER_OP(LOADMEMTSO,          LoadMemTSO);
-  REGISTER_OP(STOREMEMTSO,         StoreMemTSO);
+  if (CTX->Config.TSOEnabled) {
+    REGISTER_OP(LOADMEMTSO,          LoadMemTSO);
+    REGISTER_OP(STOREMEMTSO,         StoreMemTSO);
+  }
+  else {
+    REGISTER_OP(LOADMEMTSO,          LoadMem);
+    REGISTER_OP(STOREMEMTSO,         StoreMem);
+  }
   REGISTER_OP(VLOADMEMELEMENT,     VLoadMemElement);
   REGISTER_OP(VSTOREMEMELEMENT,    VStoreMemElement);
 #undef REGISTER_OP

@@ -92,7 +92,19 @@ namespace Core {
 
     constexpr static size_t MAX_SIGNALS {64};
 
+    // Use the last signal just so we are less likely to ever conflict with something that the guest application is using
+    // 64 is used internally by Valgrind
+    constexpr static size_t SIGNAL_FOR_PAUSE {63};
+
   private:
+    enum DefaultBehaviour {
+      DEFAULT_TERM,
+      // Core dump based signals are supposed to have a coredump appear
+      // For FEX's behaviour we don't really care right now
+      DEFAULT_COREDUMP = DEFAULT_TERM,
+      DEFAULT_IGNORE,
+    };
+
     struct SignalHandler {
       std::atomic<bool> Installed{};
       struct sigaction HostAction{};
@@ -100,9 +112,10 @@ namespace Core {
       HostSignalDelegatorFunction Handler{};
       HostSignalDelegatorFunctionForGuest GuestHandler{};
       GuestSigAction GuestAction{};
+      DefaultBehaviour DefaultBehaviour {DEFAULT_TERM};
     };
 
-    SignalHandler HostHandlers[MAX_SIGNALS]{};
+    SignalHandler HostHandlers[MAX_SIGNALS + 1]{};
     bool InstallHostThunk(int Signal);
     void UpdateHostThunk(int Signal);
 

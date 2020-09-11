@@ -7,6 +7,10 @@
 
 #include <string.h>
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 namespace FEXCore {
   constexpr static uint32_t SS_AUTODISARM = (1U << 31);
   constexpr static uint32_t X86_MINSIGSTKSZ  = 0x2000U;
@@ -17,7 +21,11 @@ namespace FEXCore {
   struct ThreadState {
     FEXCore::Core::InternalThreadState *Thread{};
     void *AltStackPtr{};
-    stack_t GuestAltStack{};
+    stack_t GuestAltStack {
+      .ss_sp = nullptr,
+      .ss_flags = SS_DISABLE, // By default the guest alt stack is disabled
+      .ss_size = 0,
+    };
     // Guest signal sa_mask is per thread!
     SignalDelegator::GuestSAMask Guest_sa_mask[SignalDelegator::MAX_SIGNALS]{};
     uint32_t CurrentSignal{};
@@ -62,71 +70,86 @@ namespace FEXCore {
 
     if (!Thread) {
       LogMan::Msg::E("Thread has received a signal and hasn't registered itself with the delegate! Programming error!");
-      exit(-1);
-      return;
-    }
-
-    if (Handler.Handler &&
-        Handler.Handler(Thread, Signal, Info, UContext)) {
-      // If the host handler handled the fault then we can continue now
-      return;
-    }
-
-    // If the signal was sent by the user with kill then we can't block it
-    // If it was sent by raise() then we /can/ block it
-    bool SentByUser = SigInfo->si_code <= 0;
-
-    if (Signal == SIGCHLD) {
-      // Do some special handling around this signal
-      // If the guest has a signal handler installed with SA_NOCLDSTOP or SA_NOCHLDWAIT then
-      // handle carefully
-      if (Handler.GuestAction.sa_flags & SA_NOCLDSTOP &&
-          !SentByUser) {
-        // If we were sent the signal from kill, tkill, or tgkill
-        // then si_code is set to SI_TKILL and should be delivered to the guest
-        // Otherwise if NOCLDSTOP is set without this code, just drop the signal
-        return;
-      }
-
-      if (Handler.GuestAction.sa_flags & SA_NOCLDWAIT) {
-        // Linux will still generate a signal for this
-        // POSIX leaves it unspecific
-        // "do not transform children in to zombies when they terminate"
-        // XXX: Handle this
-      }
-    }
-
-    // Signal specific mask check
-    if (SigIsMember(&ThreadData.Guest_sa_mask[ThreadData.CurrentSignal], Signal)) {
-      // If we are in a signal and our signal mask is blocking this signal then ignore it
-      return;
-    }
-
-    // Thread specific mask check
-    if (ThreadData.GuestProcMask & (Signal - 1)) {
-      // If the thread specific mask masks the signal then it is hidden from the guest
-      // It gets put in to the pending signals mask
-      ThreadData.PendingSignals |= 1ULL << (Signal - 1);
-      return;
-    }
-
-    ThreadData.CurrentSignal = Signal;
-
-    // We have an emulation thread pointer, we can now modify its state
-    if (Handler.GuestAction.sigaction_handler.handler == SIG_DFL) {
-      // XXX: Maybe this should actually go down guest handler state?
-      signal(Signal, SIG_DFL);
-      return;
-    }
-    else if (Handler.GuestAction.sigaction_handler.handler == SIG_IGN) {
-      return;
     }
     else {
-      if (Handler.GuestHandler &&
-          Handler.GuestHandler(Thread, Signal, Info, UContext, &Handler.GuestAction, &ThreadData.GuestAltStack)) {
+      if (Handler.Handler &&
+          Handler.Handler(Thread, Signal, Info, UContext)) {
+        // If the host handler handled the fault then we can continue now
         return;
       }
-      ERROR_AND_DIE("Unhandled guest exception");
+
+      // If the signal was sent by the user with kill then we can't block it
+      // If it was sent by raise() then we /can/ block it
+      bool SentByUser = SigInfo->si_code <= 0;
+
+      if (Signal == SIGCHLD) {
+        // Do some special handling around this signal
+        // If the guest has a signal handler installed with SA_NOCLDSTOP or SA_NOCHLDWAIT then
+        // handle carefully
+        if (Handler.GuestAction.sa_flags & SA_NOCLDSTOP &&
+            !SentByUser) {
+          // If we were sent the signal from kill, tkill, or tgkill
+          // then si_code is set to SI_TKILL and should be delivered to the guest
+          // Otherwise if NOCLDSTOP is set without this code, just drop the signal
+          return;
+        }
+
+        if (Handler.GuestAction.sa_flags & SA_NOCLDWAIT) {
+          // Linux will still generate a signal for this
+          // POSIX leaves it unspecific
+          // "do not transform children in to zombies when they terminate"
+          // XXX: Handle this
+        }
+      }
+
+      // Signal specific mask check
+      if (SigIsMember(&ThreadData.Guest_sa_mask[ThreadData.CurrentSignal], Signal)) {
+        // If we are in a signal and our signal mask is blocking this signal then ignore it
+        return;
+      }
+
+      // Thread specific mask check
+      if (ThreadData.GuestProcMask & (Signal - 1)) {
+        // If the thread specific mask masks the signal then it is hidden from the guest
+        // It gets put in to the pending signals mask
+        ThreadData.PendingSignals |= 1ULL << (Signal - 1);
+        return;
+      }
+
+      ThreadData.CurrentSignal = Signal;
+
+      // We have an emulation thread pointer, we can now modify its state
+      if (Handler.GuestAction.sigaction_handler.handler == SIG_DFL) {
+        if (Handler.DefaultBehaviour == DEFAULT_TERM) {
+          if (Thread->State.ThreadManager.clear_child_tid) {
+            std::atomic<uint32_t> *Addr = reinterpret_cast<std::atomic<uint32_t>*>(Thread->State.ThreadManager.clear_child_tid);
+            Addr->store(0);
+            syscall(SYS_futex,
+                Thread->State.ThreadManager.clear_child_tid,
+                FUTEX_WAKE,
+                ~0ULL,
+                0,
+                0,
+                0);
+          }
+
+          Thread->StatusCode = -Signal;
+
+          // Doesn't return
+          Thread->CTX->StopThread(Thread);
+          std::unexpected();
+        }
+      }
+      else if (Handler.GuestAction.sigaction_handler.handler == SIG_IGN) {
+        return;
+      }
+      else {
+        if (Handler.GuestHandler &&
+            Handler.GuestHandler(Thread, Signal, Info, UContext, &Handler.GuestAction, &ThreadData.GuestAltStack)) {
+          return;
+        }
+        ERROR_AND_DIE("Unhandled guest exception");
+      }
     }
 
     // Unhandled crash
@@ -235,6 +258,29 @@ namespace FEXCore {
     // "Userspace" SIGRTMIN starts at 34 because of this
     HostHandlers[__SIGRTMIN].Installed   = true;
     HostHandlers[__SIGRTMIN+1].Installed = true;
+
+    // Most signals default to termination
+    // These ones are slightly different
+    const std::vector<std::pair<int, SignalDelegator::DefaultBehaviour>> SignalDefaultBehaviours = {
+      {SIGQUIT,   DEFAULT_COREDUMP},
+      {SIGILL,    DEFAULT_COREDUMP},
+      {SIGTRAP,   DEFAULT_COREDUMP},
+      {SIGABRT,   DEFAULT_COREDUMP},
+      {SIGBUS,    DEFAULT_COREDUMP},
+      {SIGFPE,    DEFAULT_COREDUMP},
+      {SIGSEGV,   DEFAULT_COREDUMP},
+      {SIGCHLD,   DEFAULT_IGNORE},
+      {SIGCONT,   DEFAULT_IGNORE},
+      {SIGURG,    DEFAULT_IGNORE},
+      {SIGXCPU,   DEFAULT_COREDUMP},
+      {SIGXFSZ,   DEFAULT_COREDUMP},
+      {SIGSYS,    DEFAULT_COREDUMP},
+      {SIGWINCH,  DEFAULT_IGNORE},
+    };
+
+    for (auto Behaviour : SignalDefaultBehaviours) {
+      HostHandlers[Behaviour.first].DefaultBehaviour = Behaviour.second;
+    }
   }
 
   void SignalDelegator::RegisterTLSState(FEXCore::Core::InternalThreadState *Thread) {
@@ -363,7 +409,8 @@ namespace FEXCore {
     uint64_t AltStackEnd = AltStackBase + ThreadData.GuestAltStack.ss_size;
     uint64_t GuestSP = ThreadData.Thread->State.State.gregs[X86State::REG_RSP];
 
-    if (GuestSP >= AltStackBase &&
+    if (!(ThreadData.GuestAltStack.ss_flags & SS_DISABLE) &&
+        GuestSP >= AltStackBase &&
         GuestSP <= AltStackEnd) {
       UsingAltStack = true;
     }
@@ -390,10 +437,16 @@ namespace FEXCore {
       }
 
       // We need to check for invalid flags
-      // The only flag that can be passed is SS_AUTODISARM
-      if (ss->ss_flags & ~SS_AUTODISARM) {
+      // The only flag that can be passed is SS_AUTODISARM and SS_DISABLE
+      if (ss->ss_flags & ~(SS_AUTODISARM | SS_DISABLE)) {
         // A flag remained that isn't one of the supported ones?
         return -EINVAL;
+      }
+
+      if (ss->ss_flags & SS_DISABLE) {
+        // If SS_DISABLE Is specified then the rest of the details are ignored
+        ThreadData.GuestAltStack = *ss;
+        return 0;
       }
 
       // stack size needs to be MINSIGSTKSZ (0x2000)
@@ -425,6 +478,17 @@ namespace FEXCore {
       }
       else {
         return -EINVAL;
+      }
+    }
+
+    // Do we have any pending signals that became unmasked?
+    uint64_t PendingSignals = ~ThreadData.GuestProcMask & ThreadData.PendingSignals;
+    if (PendingSignals != 0) {
+      for (int i = 0; i < 64; ++i) {
+        if (PendingSignals & (1ULL << i)) {
+          tgkill(ThreadData.Thread->State.ThreadManager.PID, ThreadData.Thread->State.ThreadManager.TID, i + 1);
+          PendingSignals &= ~(1ULL << i);
+        }
       }
     }
 

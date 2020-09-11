@@ -72,7 +72,7 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs) {
     GPRIndexes = &GPRIndexes_32;
   }
 
-  auto NewRIP = _Constant(Op->PC);
+  auto NewRIP = _Constant(GPRSize * 8, Op->PC);
   _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, rip), NewRIP);
 
   auto SyscallOp = _Syscall(
@@ -724,7 +724,7 @@ void OpDispatchBuilder::LoopOp(OpcodeArgs) {
   uint64_t Target = Op->PC + Op->InstSize + Op->Src[1].TypeLiteral.Literal;
 
   OrderedNode *CondReg = LoadSource(GPRClass, Op, Op->Src[0], Op->Flags, -1);
-  CondReg = _Sub(CondReg, _Constant(SrcSize, 1));
+  CondReg = _Sub(CondReg, _Constant(SrcSize * 8, 1));
   StoreResult(GPRClass, Op, Op->Src[0], CondReg, -1);
 
   SrcCond = _Select(FEXCore::IR::COND_NEQ,
@@ -1455,8 +1455,8 @@ void OpDispatchBuilder::CPUIDOp(OpcodeArgs) {
 
   _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RAX]), _Bfe(32, 0,  Result_Lower));
   _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RBX]), _Bfe(32, 32, Result_Lower));
-  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RDX]), _Bfe(32, 0,  Result_Upper));
-  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RCX]), _Bfe(32, 32, Result_Upper));
+  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RDX]), _Bfe(32, 32, Result_Upper));
+  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RCX]), _Bfe(32, 0,  Result_Upper));
 }
 
 template<bool SHL1Bit>
