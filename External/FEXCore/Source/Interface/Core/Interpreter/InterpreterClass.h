@@ -33,6 +33,9 @@ public:
   void CreateAsmDispatch(FEXCore::Context::Context *ctx, FEXCore::Core::InternalThreadState *Thread);
   void DeleteAsmDispatch();
 
+  using CallbackReturn =  __attribute__((naked)) void(*)(FEXCore::Core::InternalThreadState *Thread, volatile void *Host_RSP);
+  CallbackReturn ReturnPtr;
+
 private:
   FEXCore::Context::Context *CTX;
   FEXCore::Core::InternalThreadState *State;
@@ -42,16 +45,10 @@ private:
   bool HandleGuestSignal(int Signal, void *info, void *ucontext, SignalDelegator::GuestSigAction *GuestAction, stack_t *GuestStack);
 
   template<typename Res>
-  Res GetDest(IR::OrderedNodeWrapper Op);
+  Res GetDest(void* SSAData, IR::OrderedNodeWrapper Op);
 
   template<typename Res>
-  Res GetSrc(IR::OrderedNodeWrapper Src);
-
-  std::vector<uint8_t> TmpSpace;
-  DestMapType DestMap;
-  size_t TmpOffset{};
-
-  FEXCore::IR::IRListView<true> *CurrentIR;
+  Res GetSrc(void* SSAData, IR::OrderedNodeWrapper Src);
 
   DispatchGenerator *Generator{};
 };

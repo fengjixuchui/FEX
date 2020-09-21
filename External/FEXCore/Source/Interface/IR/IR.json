@@ -65,24 +65,53 @@
     "CodeBlock": {
       "OpClass": "Misc",
       "SwitchGen": false,
-      "SSAArgs": "3",
+      "SSAArgs": "2",
       "RAOverride": "0",
       "SSANames": [
         "Begin",
-        "Last",
-        "Next"
+        "Last"
       ]
     },
     "BeginBlock": {
-      "OpClass": "Misc"
+      "HasSideEffects": true,
+      "OpClass": "Misc",
+      "SwitchGen": false,
+      "SSAArgs": "1",
+      "RAOverride": "0",
+      "SSANames": [
+        "BlockHeader"
+      ]
     },
 
     "EndBlock": {
       "HasSideEffects": true,
       "OpClass": "Misc",
       "SwitchGen": false,
+      "SSAArgs": "1",
+      "RAOverride": "0",
+      "SSANames": [
+        "BlockHeader"
+      ]
+    },
+
+    "ValidateCode": {
+      "HasSideEffects": true,
+      "OpClass": "Misc",
+      "HasDest": true,
+      "DestClass": "GPR",
+      "DestSize": "8",
       "Args": [
-        "uint64_t", "RIPIncrement"
+        "__uint128_t", "CodeOriginal",
+        "uint64_t", "CodePtr",
+        "uint8_t", "CodeLength"
+      ]
+    },
+
+    "RemoveCodeEntry": {
+      "HasSideEffects": true,
+      "OpClass": "Misc",
+      "Args": [
+        "uint64_t", "RIP"
       ]
     },
 
@@ -124,6 +153,11 @@
     },
 
     "SignalReturn": {
+      "HasSideEffects": true,
+      "OpClass": "Branch"
+    },
+
+    "CallbackReturn": {
       "HasSideEffects": true,
       "OpClass": "Branch"
     },
@@ -760,7 +794,7 @@
               ],
       "OpClass": "ALU",
       "HasDest": true,
-      "DestSize": "std::max<uint8_t>(4, std::max(GetOpSize(ssa0), GetOpSize(ssa1)))",
+      "DestSize": "std::max<uint8_t>(4, GetOpSize(ssa0))",
       "DestClass": "GPR",
       "SSAArgs": "2"
     },
@@ -800,6 +834,22 @@
       "HasDest": true,
       "DestClass": "GPR",
       "SSAArgs": "2"
+    },
+
+    "Extr": {
+      "Desc": ["Concats the two GPRs to create a value that is the size of the full two GPRs",
+               "It then extracts a bitfield width that size of a GPR from the LSB",
+               "Valid LSB range is 0-31 for 32bit and 0-63 for 64bit",
+               "<Size * 2> ConcatValue = src0:src1",
+               "Result = ConcatValue<LSB+Size - 1: LSB>"
+              ],
+      "OpClass": "ALU",
+      "HasDest": true,
+      "DestClass": "GPR",
+      "SSAArgs": "2",
+      "Args": [
+        "uint8_t", "LSB"
+      ]
     },
 
     "LDiv": {

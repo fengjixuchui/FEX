@@ -6,6 +6,7 @@
 #include <FEXCore/Core/CodeLoader.h>
 #include <FEXCore/Core/X86Enums.h>
 
+#include <grp.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <stdint.h>
@@ -80,6 +81,17 @@ namespace FEXCore::HLE {
       // update the internal TID
       Thread->State.ThreadManager.TID = ::gettid();
       Thread->State.ThreadManager.PID = ::getpid();
+      Thread->State.ThreadManager.clear_child_tid = nullptr;
+
+      // Clear all the other threads that are being tracked
+      for (auto &DeadThread : Thread->CTX->Threads) {
+        if (DeadThread == Thread) {
+          continue;
+        }
+
+        // Setting running to false ensures that when they shutdown we won't send signals to kill them
+        DeadThread->State.RunningEvents.Running = false;
+      }
 
       // only a  single thread running so no need to remove anything from the thread array
 
@@ -174,7 +186,7 @@ namespace FEXCore::HLE {
       }
 
       if (!(flags & CLONE_THREAD)) {
-        
+
         if (flags & CLONE_VFORK) {
           flags &= ~CLONE_VFORK;
           flags &= ~CLONE_VM;
@@ -188,7 +200,7 @@ namespace FEXCore::HLE {
         // CLONE_PARENT is ignored (Implied by CLONE_THREAD)
 
         if (Thread->CTX->GetThreadCount() != 1) {
-          ERROR_AND_DIE("clone: Fork only supported on single threaded applications");
+          LogMan::Msg::E("clone: Fork only supported on single threaded applications. Allowing");
         } else {
           LogMan::Msg::D("clone: Forking process");
         }
@@ -220,7 +232,7 @@ namespace FEXCore::HLE {
 
     REGISTER_SYSCALL_IMPL(fork, [](FEXCore::Core::InternalThreadState *Thread) -> uint64_t {
       if (Thread->CTX->GetThreadCount() != 1) {
-        ERROR_AND_DIE("fork: Fork only supported on single threaded applications");
+        LogMan::Msg::E("fork: Fork only supported on single threaded applications. Allowing");
       } else {
         LogMan::Msg::D("fork: Forking process");
       }
@@ -230,7 +242,7 @@ namespace FEXCore::HLE {
 
     REGISTER_SYSCALL_IMPL(vfork, [](FEXCore::Core::InternalThreadState *Thread) -> uint64_t {
       if (Thread->CTX->GetThreadCount() != 1) {
-        ERROR_AND_DIE("vfork: Fork only supported on single threaded applications");
+        LogMan::Msg::E("vfork: Fork only supported on single threaded applications. Allowing");
       } else {
         LogMan::Msg::D("vfork: WARNING: Forking process using fork semantics");
       }
@@ -241,7 +253,7 @@ namespace FEXCore::HLE {
     // currently does not propagate argv[0] correctly
     REGISTER_SYSCALL_IMPL(execve, [](FEXCore::Core::InternalThreadState *Thread, const char *pathname, char *const argv[], char *const envp[]) -> uint64_t {
       std::vector<const char*> Args;
-      
+
       Thread->CTX->GetCodeLoader()->GetExecveArguments(&Args);
 
       Args.push_back("--");
@@ -258,7 +270,7 @@ namespace FEXCore::HLE {
       Args.push_back(nullptr);
 
       uint64_t Result = execve("/proc/self/exe", const_cast<char *const *>(&Args[0]), envp);
-      
+
       SYSCALL_ERRNO();
     });
 
@@ -353,6 +365,16 @@ namespace FEXCore::HLE {
 
     REGISTER_SYSCALL_IMPL(setregid, [](FEXCore::Core::InternalThreadState *Thread, gid_t rgid, gid_t egid) -> uint64_t {
       uint64_t Result = ::setregid(rgid, egid);
+      SYSCALL_ERRNO();
+    });
+
+    REGISTER_SYSCALL_IMPL(getgroups, [](FEXCore::Core::InternalThreadState *Thread, int size, gid_t list[]) -> uint64_t {
+      uint64_t Result = ::getgroups(size, list);
+      SYSCALL_ERRNO();
+    });
+
+    REGISTER_SYSCALL_IMPL(setgroups, [](FEXCore::Core::InternalThreadState *Thread, size_t size, const gid_t *list) -> uint64_t {
+      uint64_t Result = ::setgroups(size, list);
       SYSCALL_ERRNO();
     });
 
@@ -465,7 +487,7 @@ namespace FEXCore::HLE {
       SYSCALL_STUB(setpgid);
     });*/
     REGISTER_SYSCALL_FORWARD_ERRNO(setpgid);
-   
+
     /*REGISTER_SYSCALL_IMPL(getpgid, [](FEXCore::Core::InternalThreadState *Thread, pid_t pid) -> uint64_t {
       SYSCALL_STUB(getpgid);
     });*/
@@ -485,5 +507,20 @@ namespace FEXCore::HLE {
       SYSCALL_STUB(getsid);
     });*/
     REGISTER_SYSCALL_FORWARD_ERRNO(getsid);
+
+    REGISTER_SYSCALL_IMPL(waitid, [](FEXCore::Core::InternalThreadState *Thread, idtype_t idtype, id_t id, siginfo_t *infop, int options) -> uint64_t {
+      uint64_t Result = ::waitid(idtype, id, infop, options);
+      SYSCALL_ERRNO();
+    });
+
+    REGISTER_SYSCALL_IMPL(unshare, [](FEXCore::Core::InternalThreadState *Thread, int flags) -> uint64_t {
+      uint64_t Result = ::unshare(flags);
+      SYSCALL_ERRNO();
+    });
+
+    REGISTER_SYSCALL_IMPL(setns, [](FEXCore::Core::InternalThreadState *Thread, int fd, int nstype) -> uint64_t {
+      uint64_t Result = ::setns(fd, nstype);
+      SYSCALL_ERRNO();
+    });
   }
 }

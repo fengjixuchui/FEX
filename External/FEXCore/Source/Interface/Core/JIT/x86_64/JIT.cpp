@@ -263,7 +263,6 @@ JITCore::JITCore(FEXCore::Context::Context *ctx, FEXCore::Core::InternalThreadSt
   , InitialCodeBuffer {Buffer}
 {
   CurrentCodeBuffer = &InitialCodeBuffer;
-  Stack.resize(9000 * 16 * 64);
 
   RAPass = Thread->PassManager->GetRAPass();
 
@@ -417,17 +416,9 @@ Xbyak::Xmm JITCore::GetDst(uint32_t Node) {
 
 void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const *IR, [[maybe_unused]] FEXCore::Core::DebugData *DebugData) {
   JumpTargets.clear();
-  CurrentIR = IR;
-  uint32_t SSACount = CurrentIR->GetSSACount();
-  uintptr_t ListBegin = CurrentIR->GetListData();
-  uintptr_t DataBegin = CurrentIR->GetData();
+  uint32_t SSACount = IR->GetSSACount();
 
-  auto HeaderIterator = CurrentIR->begin();
-  IR::OrderedNodeWrapper *HeaderNodeWrapper = HeaderIterator();
-  IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
-  auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
-  LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
-
+  auto HeaderOp = IR->GetHeader();
   if (HeaderOp->ShouldInterpret) {
     return InterpreterFallbackHelperAddress;
   }
@@ -437,11 +428,6 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
   if ((getSize() + BufferRange) > CurrentCodeBuffer->Size) {
     LogMan::Msg::D("Gotta clear code cache: 0x%lx is too close to 0x%lx", getSize(), CurrentCodeBuffer->Size);
     ThreadState->CTX->ClearCodeCache(ThreadState, HeaderOp->Entry);
-  }
-
-  uint64_t ListStackSize = SSACount * 16;
-  if (ListStackSize > Stack.size()) {
-    Stack.resize(ListStackSize);
   }
 
 	void *Entry = getCurr<void*>();
@@ -514,18 +500,13 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
     ret();
   };
 
-  IR::OrderedNode *BlockNode = HeaderOp->Blocks.GetNode(ListBegin);
-  while (1) {
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     using namespace FEXCore::IR;
-    auto BlockIROp = BlockNode->Op(DataBegin)->CW<FEXCore::IR::IROp_CodeBlock>();
-    LogMan::Throw::A(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
-
-    // We grab these nodes this way so we can iterate easily
-    auto CodeBegin = CurrentIR->at(BlockIROp->Begin);
-    auto CodeLast = CurrentIR->at(BlockIROp->Last);
-
     {
-      uint32_t Node = BlockNode->Wrapped(ListBegin).ID();
+      auto BlockIROp = BlockHeader->CW<IROp_CodeBlock>();
+      LogMan::Throw::A(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
+
+      uint32_t Node = IR->GetID(BlockNode);
       auto IsTarget = JumpTargets.find(Node);
       if (IsTarget == JumpTargets.end()) {
         IsTarget = JumpTargets.try_emplace(Node).first;
@@ -534,12 +515,9 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
       L(IsTarget->second);
     }
 
-    while (1) {
-      OrderedNodeWrapper *WrapperOp = CodeBegin();
-      OrderedNode *RealNode = WrapperOp->GetNode(ListBegin);
-      FEXCore::IR::IROp_Header *IROp = RealNode->Op(DataBegin);
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
       uint8_t OpSize = IROp->Size;
-      uint32_t Node = WrapperOp->ID();
+      uint32_t Node = IR->GetID(CodeNode);
 
       #ifdef DEBUG_RA
       if (IROp->Op != IR::OP_BEGINBLOCK &&
@@ -578,24 +556,6 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
       #endif
 
       switch (IROp->Op) {
-        case IR::OP_BEGINBLOCK: {
-          auto IsTarget = JumpTargets.find(Node);
-          if (IsTarget == JumpTargets.end()) {
-            IsTarget = JumpTargets.try_emplace(Node).first;
-          }
-          else {
-          }
-
-          L(IsTarget->second);
-          break;
-        }
-        case IR::OP_ENDBLOCK: {
-          auto Op = IROp->C<IR::IROp_EndBlock>();
-          if (Op->RIPIncrement) {
-            add(qword [STATE + offsetof(FEXCore::Core::CPUState, rip)], Op->RIPIncrement);
-          }
-          break;
-        }
         case IR::OP_EXITFUNCTION: {
           RegularExit();
           break;
@@ -611,6 +571,36 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
 
           mov(TMP1, SignalHandlerReturnAddress);
           jmp(TMP1);
+          break;
+        }
+        case IR::OP_CALLBACKRETURN: {
+          // Adjust the stack first for a regular return
+          if (SpillSlots) {
+            add(rsp, SpillSlots * 16 + 8 + 8); // + 8 to consume return address
+          }
+          else {
+            add(rsp, 8 + 8); // + 8 to consume return address
+          }
+
+          // Make sure to adjust the refcounter so we don't clear the cache now
+          mov(rax, reinterpret_cast<uint64_t>(&SignalHandlerRefCounter));
+          sub(dword [rax], 1);
+
+          // We need to adjust an additional 8 bytes to get back to the original "misaligned" RSP state
+          add(qword [STATE + offsetof(FEXCore::Core::InternalThreadState, State.State.gregs[X86State::REG_RSP])], 8);
+
+          // Now jump back to the thunk
+          // XXX: XMM?
+          add(rsp, 8);
+
+          pop(r15);
+          pop(r14);
+          pop(r13);
+          pop(r12);
+          pop(rbp);
+          pop(rbx);
+
+          ret();
           break;
         }
         case IR::OP_BREAK: {
@@ -1210,8 +1200,6 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
         }
         case IR::OP_ADD: {
           auto Op = IROp->C<IR::IROp_Add>();
-          Xbyak::Reg SrcA;
-          Xbyak::Reg Dst;
           mov(rax, GetSrc<RA_64>(Op->Header.Args[1].ID()));
           switch (OpSize) {
           case 4:
@@ -1426,6 +1414,31 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           Sbfe_done:
           break;
         }
+        case IR::OP_BFI: {
+          auto Op = IROp->C<IR::IROp_Bfi>();
+          auto Dst = GetDst<RA_64>(Node);
+
+          uint64_t SourceMask = (1ULL << Op->Width) - 1;
+          if (Op->Width == 64)
+            SourceMask = ~0ULL;
+          uint64_t DestMask = ~(SourceMask << Op->lsb);
+
+          mov(TMP1, GetSrc<RA_64>(Op->Header.Args[1].ID()));
+          mov(Dst, GetSrc<RA_64>(Op->Header.Args[0].ID()));
+
+          mov(TMP2, DestMask);
+          and(Dst, TMP2);
+          mov(TMP2, SourceMask);
+          and(TMP1, TMP2);
+          shl(TMP1, Op->lsb);
+          or_(Dst, TMP1);
+
+          if (OpSize != 8) {
+            mov(rcx, uint64_t((1ULL << (OpSize * 8)) - 1));
+            and(Dst, rcx);
+          }
+          break;
+        }
         case IR::OP_LSHR: {
           auto Op = IROp->C<IR::IROp_Lshr>();
           uint8_t Mask = OpSize * 8 - 1;
@@ -1485,12 +1498,12 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           case 1:
             movsx(rax, GetSrc<RA_8>(Op->Header.Args[0].ID()));
             sar(al, cl);
-            movsx(GetDst<RA_64>(Node), al);
+            movzx(GetDst<RA_64>(Node), al);
           break;
           case 2:
             movsx(rax, GetSrc<RA_16>(Op->Header.Args[0].ID()));
             sar(ax, cl);
-            movsx(GetDst<RA_64>(Node), ax);
+            movzx(GetDst<RA_64>(Node), ax);
           break;
           case 4:
             mov(GetDst<RA_32>(Node), GetSrc<RA_32>(Op->Header.Args[0].ID()));
@@ -1566,6 +1579,28 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           mov(GetDst<RA_64>(Node), rax);
           break;
         }
+        case IR::OP_EXTR: {
+          auto Op = IROp->C<IR::IROp_Extr>();
+
+          switch (OpSize) {
+            case 4: {
+              mov(eax, GetSrc<RA_32>(Op->Header.Args[0].ID()));
+              mov(ecx, GetSrc<RA_32>(Op->Header.Args[1].ID()));
+              shrd(ecx, eax, Op->LSB);
+              mov(GetDst<RA_32>(Node), ecx);
+              break;
+            }
+            case 8: {
+              mov(rax, GetSrc<RA_64>(Op->Header.Args[0].ID()));
+              mov(rcx, GetSrc<RA_64>(Op->Header.Args[1].ID()));
+              shrd(rcx, rax, Op->LSB);
+              mov(GetDst<RA_64>(Node), rcx);
+              break;
+            }
+          }
+          break;
+        }
+
         case IR::OP_MUL: {
           auto Op = IROp->C<IR::IROp_Mul>();
           auto Dst = GetDst<RA_64>(Node);
@@ -4817,7 +4852,68 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VALIDATECODE:
+        {
+          auto Op = IROp->C<IR::IROp_ValidateCode>();
+          uint8_t* NewCode = (uint8_t*)Op->CodePtr;
+          uint8_t* OldCode = (uint8_t*)&Op->CodeOriginal;
+          int len = Op->CodeLength;
+          int idx = 0;
+
+          xor_(GetDst<RA_64>(Node), GetDst<RA_64>(Node));
+          mov(rax, Op->CodePtr);
+          mov(rbx, 1);
+          while (len >= 4) {
+            cmp(dword[rax + idx], *(uint32_t*)(OldCode + idx));
+            cmovne(GetDst<RA_64>(Node), rbx);
+            len-=4;
+            idx+=4;
+          }
+          while (len >= 2) {
+            mov(rcx, *(uint16_t*)(OldCode + idx));
+            cmp(word[rax + idx], cx);
+            cmovne(GetDst<RA_64>(Node), rbx);
+            len-=2;
+            idx+=2;
+          }
+          while (len >= 1) {
+            cmp(byte[rax + idx], *(uint8_t*)(OldCode + idx));
+            cmovne(GetDst<RA_64>(Node), rbx);
+            len-=1;
+            idx+=1;
+          }
+          break;
+        }
+        case IR::OP_REMOVECODEENTRY: {
+          auto Op = IROp->C<IR::IROp_RemoveCodeEntry>();
+          
+          auto NumPush = RA64.size();
+
+          for (auto &Reg : RA64)
+            push(Reg);
+
+          if (NumPush & 1)
+            sub(rsp, 8); // Align
+          
+          mov(rdi, STATE);
+          mov(rax, Op->RIP); // imm64 move
+          mov(rsi, rax);
+
+          
+          mov(rax, reinterpret_cast<uintptr_t>(&Context::Context::RemoveCodeEntry));
+          call(rax);
+
+          if (NumPush & 1)
+            add(rsp, 8); // Align
+
+          for (uint32_t i = RA64.size(); i > 0; --i)
+            pop(RA64[i - 1]);
+
+          break;
+        }
         case IR::OP_DUMMY:
+        case IR::OP_BEGINBLOCK:
+        case IR::OP_ENDBLOCK:
         case IR::OP_IRHEADER:
         case IR::OP_PHIVALUE:
         case IR::OP_PHI:
@@ -4826,18 +4922,6 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           LogMan::Msg::A("Unknown IR Op: %d(%s)", IROp->Op, FEXCore::IR::GetName(IROp->Op).data());
           break;
       }
-
-      // CodeLast is inclusive. So we still need to dump the CodeLast op as well
-      if (CodeBegin == CodeLast) {
-        break;
-      }
-      ++CodeBegin;
-    }
-
-    if (BlockIROp->Next.ID() == 0) {
-      break;
-    } else {
-      BlockNode = BlockIROp->Next.GetNode(ListBegin);
     }
   }
 
@@ -4862,16 +4946,6 @@ static void SleepThread(FEXCore::Context::Context *ctx, FEXCore::Core::InternalT
   Thread->State.RunningEvents.Running = true;
   ++ctx->IdleWaitRefCount;
   ctx->IdleWaitCV.notify_all();
-}
-
-static void CookieFailure(uint64_t Cookie) {
-  if (Cookie != 0x3132333435363738ULL) {
-    LogMan::Msg::D("Cookie wasn't correct");
-    std::unexpected();
-  }
-  else {
-    LogMan::Msg::D("[JIT] Cookie was correct");
-  }
 }
 
 void JITCore::CreateCustomDispatch(FEXCore::Core::InternalThreadState *Thread) {
@@ -4952,6 +5026,11 @@ void JITCore::CreateCustomDispatch(FEXCore::Core::InternalThreadState *Thread) {
     and(rax, 0x0FFF);
 
     shl(rax, (int)log2(sizeof(FEXCore::BlockCache::BlockCacheEntry)));
+
+    // check for aliasing
+    mov(rcx, qword [rdi + rax + 8]);
+    cmp(rcx, rdx);
+    jne(NoBlock);
 
     // Load the block pointer
     mov(rax, qword [rdi + rax]);
@@ -5065,6 +5144,42 @@ void JITCore::CreateCustomDispatch(FEXCore::Core::InternalThreadState *Thread) {
 
     PauseReturnInstruction = getCurr<uint64_t>();
     ud2();
+  }
+
+  {
+    CallbackPtr = getCurr<CPUBackend::JITCallback>();
+
+    push(rbx);
+    push(rbp);
+    push(r12);
+    push(r13);
+    push(r14);
+    push(r15);
+    sub(rsp, 8);
+
+    // First thing we need to move the thread state pointer back in to our register
+    mov(STATE, rdi);
+    // XXX: XMM?
+
+    // Make sure to adjust the refcounter so we don't clear the cache now
+    mov(rax, reinterpret_cast<uint64_t>(&SignalHandlerRefCounter));
+    add(dword [rax], 1);
+
+    // Now push the callback return trampoline to the guest stack
+    // Guest will be misaligned because calling a thunk won't correct the guest's stack once we call the callback from the host
+    mov(rax, CTX->X86CodeGen.CallbackReturn);
+
+    // Store the trampoline to the guest stack
+    // Guest stack is now correctly misaligned after a regular call instruction
+    sub(qword [STATE + offsetof(FEXCore::Core::InternalThreadState, State.State.gregs[X86State::REG_RSP])], 16);
+    mov(rbx, qword [STATE + offsetof(FEXCore::Core::InternalThreadState, State.State.gregs[X86State::REG_RSP])]);
+    mov(qword [rbx], rax);
+
+    // Store RIP to the context state
+    mov(qword [STATE + offsetof(FEXCore::Core::InternalThreadState, State.State.rip)], rsi);
+
+    // Back to the loop top now
+    jmp(LoopTop);
   }
 
   ready();

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "Interface/Core/BlockCache.h"
-#include "Interface/Core/InternalThreadState.h"
 
 #include "aarch64/assembler-aarch64.h"
 #include "aarch64/cpu-aarch64.h"
@@ -21,6 +20,10 @@
 #define VTMP1 v1
 #define VTMP2 v2
 #define VTMP3 v3
+
+namespace FEXCore::Core {
+  struct InternalThreadState;
+}
 
 namespace FEXCore::CPU {
 using namespace vixl;
@@ -100,7 +103,6 @@ public:
 private:
   FEXCore::Context::Context *CTX;
   FEXCore::Core::InternalThreadState *State;
-  FEXCore::IR::IRListView<true> const *CurrentIR;
 
   std::map<IR::OrderedNodeWrapper::NodeOffsetType, aarch64::Label> JumpTargets;
 
@@ -258,6 +260,7 @@ private:
   DEF_OP(Ashr);
   DEF_OP(Rol);
   DEF_OP(Ror);
+  DEF_OP(Extr);
   DEF_OP(LDiv);
   DEF_OP(LUDiv);
   DEF_OP(LRem);
@@ -300,11 +303,14 @@ private:
   DEF_OP(GuestCallIndirect);
   DEF_OP(GuestReturn);
   DEF_OP(SignalReturn);
+  DEF_OP(CallbackReturn);
   DEF_OP(ExitFunction);
   DEF_OP(Jump);
   DEF_OP(CondJump);
   DEF_OP(Syscall);
   DEF_OP(Thunk);
+  DEF_OP(ValidateCode);
+  DEF_OP(RemoveCodeEntry);
   DEF_OP(CPUID);
 
   ///< Conversion ops

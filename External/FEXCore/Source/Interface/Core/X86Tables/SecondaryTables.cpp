@@ -53,7 +53,6 @@ void InitializeSecondaryTables() {
     {0x33, 1, X86InstInfo{"RDPMC",      TYPE_PRIV, FLAGS_NO_OVERLAY,                                                                             0, nullptr}},
     {0x34, 1, X86InstInfo{"SYSENTER",   TYPE_PRIV, FLAGS_NO_OVERLAY,                                                                             0, nullptr}},
     {0x35, 1, X86InstInfo{"SYSEXIT",    TYPE_PRIV, FLAGS_NO_OVERLAY,                                                                             0, nullptr}},
-    {0x37, 1, X86InstInfo{"",           TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                          0, nullptr}},
     {0x38, 1, X86InstInfo{"",           TYPE_0F38_TABLE, FLAGS_NO_OVERLAY,                                                                       0, nullptr}},
     {0x39, 1, X86InstInfo{"",           TYPE_INVALID, FLAGS_NO_OVERLAY,                                                                          0, nullptr}},
     {0x3A, 1, X86InstInfo{"",           TYPE_0F3A_TABLE, FLAGS_NO_OVERLAY,                                                                       0, nullptr}},
@@ -106,7 +105,7 @@ void InitializeSecondaryTables() {
     {0x6A, 1, X86InstInfo{"PUNPCKHDQ",  TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                   0, nullptr}},
     {0x6B, 1, X86InstInfo{"PACKSSDW",   TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                   0, nullptr}},
     {0x6C, 2, X86InstInfo{"",           TYPE_INVALID, FLAGS_NONE,                                                                                       0, nullptr}},
-    {0x6E, 1, X86InstInfo{"MOVD",       TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_SRC_GPR | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                0, nullptr}},
+    {0x6E, 1, X86InstInfo{"MOVD",       TYPE_INST, GenFlagsDstSize(SIZE_64BIT)   | FLAGS_MODRM | FLAGS_SF_SRC_GPR | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                0, nullptr}},
     {0x6F, 1, X86InstInfo{"MOVQ",       TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                   0, nullptr}},
 
     {0x70, 1, X86InstInfo{"PSHUFW",     TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                                   1, nullptr}},
@@ -118,7 +117,7 @@ void InitializeSecondaryTables() {
     {0x76, 1, X86InstInfo{"PCMPEQD",    TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                         0, nullptr}},
     {0x77, 1, X86InstInfo{"EMMS",       TYPE_INST, FLAGS_NONE,                                                                                    0, nullptr}},
     {0x78, 6, X86InstInfo{"",           TYPE_INVALID, FLAGS_NONE,                                                                                       0, nullptr}},
-    {0x7E, 1, X86InstInfo{"MOVD",       TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_DST_GPR | FLAGS_XMM_FLAGS | FLAGS_SF_MMX, 0, nullptr}},
+    {0x7E, 1, X86InstInfo{"MOVD",       TYPE_INST, GenFlagsSrcSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_SF_DST_GPR | FLAGS_XMM_FLAGS | FLAGS_SF_MMX, 0, nullptr}},
     {0x7F, 1, X86InstInfo{"MOVQ",       TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_XMM_FLAGS | FLAGS_SF_MMX,                    0, nullptr}},
 
     {0x80, 1, X86InstInfo{"JO",      TYPE_INST, GenFlagsSameSize(SIZE_64BIT) | FLAGS_SETS_RIP | FLAGS_SRC_SEXT | FLAGS_DISPLACE_SIZE_DIV_2 | FLAGS_NO_OVERLAY,    4, nullptr}},
@@ -188,7 +187,7 @@ void InitializeSecondaryTables() {
     {0xBE, 1, X86InstInfo{"MOVSX",   TYPE_INST, GenFlagsSrcSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                        0, nullptr}},
     {0xBF, 1, X86InstInfo{"MOVSX",   TYPE_INST, GenFlagsSrcSize(SIZE_16BIT) | FLAGS_MODRM | FLAGS_NO_OVERLAY,                                       0, nullptr}},
 
-    {0xC0, 1, X86InstInfo{"XADD",    TYPE_INST, GenFlagsSrcSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST,                                                       0, nullptr}},
+    {0xC0, 1, X86InstInfo{"XADD",    TYPE_INST, GenFlagsSameSize(SIZE_8BIT) | FLAGS_MODRM | FLAGS_SF_MOD_DST,                                                       0, nullptr}},
     {0xC1, 1, X86InstInfo{"XADD",    TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_DST | FLAGS_NO_OVERLAY,                                                                 0, nullptr}},
     {0xC2, 1, X86InstInfo{"CMPPS",   TYPE_INST, GenFlagsSameSize(SIZE_128BIT) | FLAGS_MODRM | FLAGS_XMM_FLAGS,                                                     1, nullptr}},
     {0xC3, 1, X86InstInfo{"MOVNTI",  TYPE_INST, FLAGS_MODRM | FLAGS_SF_MOD_MEM_ONLY | FLAGS_SF_MOD_DST,                                                            0, nullptr}},
@@ -253,6 +252,8 @@ void InitializeSecondaryTables() {
     // Unused x86 encoding instruction.
     // Used by FEX to know when to do a signal return
     {0x36, 1, X86InstInfo{"SIGRET",       TYPE_INST, FLAGS_BLOCK_END | FLAGS_NO_OVERLAY | FLAGS_SETS_RIP,                                                            0, nullptr}},
+
+    {0x37, 1, X86InstInfo{"CALLBACKRET",  TYPE_INST, FLAGS_BLOCK_END | FLAGS_NO_OVERLAY | FLAGS_SETS_RIP,                                                                          0, nullptr}},
 
     // This was originally used by VIA to jump to its alternative instruction set. Used for OP_THUNK
     {0x3F, 1, X86InstInfo{"ALTINST",      TYPE_INST, FLAGS_BLOCK_END | FLAGS_NO_OVERLAY | FLAGS_SETS_RIP,                                                            0, nullptr}},

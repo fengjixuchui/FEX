@@ -1,8 +1,7 @@
 #include "Interface/Context/Context.h"
 
 #include "Interface/Core/JIT/Arm64/JITClass.h"
-
-#include "Interface/HLE/Syscalls.h"
+#include "Interface/Core/InternalThreadState.h"
 
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 
@@ -576,17 +575,9 @@ aarch64::VRegister JITCore::GetDst(uint32_t Node) {
 void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const *IR, [[maybe_unused]] FEXCore::Core::DebugData *DebugData) {
   using namespace aarch64;
   JumpTargets.clear();
-  CurrentIR = IR;
-  uint32_t SSACount = CurrentIR->GetSSACount();
-  uintptr_t ListBegin = CurrentIR->GetListData();
-  uintptr_t DataBegin = CurrentIR->GetData();
+  uint32_t SSACount = IR->GetSSACount();
 
-  auto HeaderIterator = CurrentIR->begin();
-  IR::OrderedNodeWrapper *HeaderNodeWrapper = HeaderIterator();
-  IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
-  auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
-  LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
-
+  auto HeaderOp = IR->GetHeader();
   if (HeaderOp->ShouldInterpret) {
     return reinterpret_cast<void*>(InterpreterFallbackHelperAddress);
   }
@@ -634,19 +625,13 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
     stp(TMP1, lr, MemOperand(sp, -16, PreIndex));
   }
 
-  IR::OrderedNode *BlockNode = HeaderOp->Blocks.GetNode(ListBegin);
-
-  while (1) {
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     using namespace FEXCore::IR;
-    auto BlockIROp = BlockNode->Op(DataBegin)->CW<FEXCore::IR::IROp_CodeBlock>();
+    auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
     LogMan::Throw::A(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
 
-    // We grab these nodes this way so we can iterate easily
-    auto CodeBegin = CurrentIR->at(BlockIROp->Begin);
-    auto CodeLast = CurrentIR->at(BlockIROp->Last);
-
     {
-      uint32_t Node = BlockNode->Wrapped(ListBegin).ID();
+      uint32_t Node = IR->GetID(BlockNode);
       auto IsTarget = JumpTargets.find(Node);
       if (IsTarget == JumpTargets.end()) {
         IsTarget = JumpTargets.try_emplace(Node).first;
@@ -655,26 +640,12 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
       bind(&IsTarget->second);
     }
 
-    while (1) {
-      OrderedNodeWrapper *WrapperOp = CodeBegin();
-      FEXCore::IR::IROp_Header *IROp = WrapperOp->GetNode(ListBegin)->Op(DataBegin);
-      uint32_t Node = WrapperOp->ID();
+    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      uint32_t ID = IR->GetID(CodeNode);
 
       // Execute handler
       OpHandler Handler = OpHandlers[IROp->Op];
-      (this->*Handler)(IROp, Node);
-
-      // CodeLast is inclusive. So we still need to dump the CodeLast op as well
-      if (CodeBegin == CodeLast) {
-        break;
-      }
-      ++CodeBegin;
-    }
-
-    if (BlockIROp->Next.ID() == 0) {
-      break;
-    } else {
-      BlockNode = BlockIROp->Next.GetNode(ListBegin);
+      (this->*Handler)(IROp, ID);
     }
   }
 
@@ -1015,6 +986,55 @@ void JITCore::CreateCustomDispatch(FEXCore::Core::InternalThreadState *Thread) {
 
     // Fault to start running again
     hlt(0);
+  }
+
+  {
+    // The expectation here is that a thunked function needs to call back in to the JIT in a reentrant safe way
+    // To do this safely we need to do some state tracking and register saving
+    //
+    // eg:
+    // JIT Call->
+    //  Thunk->
+    //    Thunk callback->
+    //
+    // The thunk callback needs to execute JIT code and when it returns, it needs to safely return to the thunk rather than JIT space
+    // This is handled by pushing a return address trampoline to the stack so when the guest address returns it hits our custom thunk return
+    //  - This will safely return us to the thunk
+    //
+    // On return to the thunk, the thunk can get whatever its return value is from the thread context depending on ABI handling on its end
+    // When the thunk itself returns, it'll do its regular return logic there
+    // void ReentrantCallback(FEXCore::Core::InternalThreadState *Thread, uint64_t RIP);
+    CallbackPtr = Buffer->GetOffsetAddress<CPUBackend::JITCallback>(GetCursorOffset());
+
+    // We expect the thunk to have previously pushed the registers it was using
+    PushCalleeSavedRegisters();
+
+    // First thing we need to move the thread state pointer back in to our register
+    mov(STATE, x0);
+
+    // Make sure to adjust the refcounter so we don't clear the cache now
+    LoadConstant(x0, reinterpret_cast<uint64_t>(&SignalHandlerRefCounter));
+    ldr(w2, MemOperand(x0));
+    add(w2, w2, 1);
+    str(w2, MemOperand(x0));
+
+    // Now push the callback return trampoline to the guest stack
+    // Guest will be misaligned because calling a thunk won't correct the guest's stack once we call the callback from the host
+    LoadConstant(x0, CTX->X86CodeGen.CallbackReturn);
+
+    ldr(x2, MemOperand(STATE, offsetof(FEXCore::Core::InternalThreadState, State.State.gregs[X86State::REG_RSP])));
+    sub(x2, x2, 16);
+    str(x2, MemOperand(STATE, offsetof(FEXCore::Core::InternalThreadState, State.State.gregs[X86State::REG_RSP])));
+
+    // Store the trampoline to the guest stack
+    // Guest stack is now correctly misaligned after a regular call instruction
+    str(x0, MemOperand(x2));
+
+    // Store RIP to the context state
+    str(x1, MemOperand(STATE, offsetof(FEXCore::Core::InternalThreadState, State.State.rip)));
+
+    // Now go back to the regular dispatcher loop
+    b(&LoopTop);
   }
 
   place(&l_VirtualMemory);

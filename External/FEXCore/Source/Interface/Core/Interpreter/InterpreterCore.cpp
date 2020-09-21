@@ -44,10 +44,6 @@ InterpreterCore::InterpreterCore(FEXCore::Context::Context *ctx, FEXCore::Core::
   : CTX {ctx}
   , State {Thread} {
   // Grab our space for temporary data
-  TmpSpace.resize(4096 * 32);
-#if !DESTMAP_AS_MAP
-  DestMap.resize(4096);
-#endif
 
   CreateAsmDispatch(ctx, Thread);
   CTX->SignalDelegation.RegisterHostSignalHandler(SignalDelegator::SIGNAL_FOR_PAUSE, [](FEXCore::Core::InternalThreadState *Thread, int Signal, void *info, void *ucontext) -> bool {
@@ -69,43 +65,15 @@ InterpreterCore::~InterpreterCore() {
   DeleteAsmDispatch();
 }
 
-uint32_t InterpreterCore::AllocateTmpSpace(size_t Size) {
-  // XXX: IR generation has a bug where the size can periodically end up being zero
-  // LogMan::Throw::A(Size !=0, "Dest Op had zero destination size");
-
-  // Some IR ops rely on the upper bits of registers being allocaed and zeroed
-  // to do an implicit zero extend
-  Size = Size < 16 ? 16 : Size;
-
-  // Force alignment by size
-  size_t NewBase = AlignUp(TmpOffset, Size);
-  size_t NewEnd = NewBase + Size;
-
-  if (NewEnd >= TmpSpace.size()) {
-    // If we are going to overrun the end of our temporary space then double the size of it
-    TmpSpace.resize(TmpSpace.size() * 2);
-  }
-
-  // Make sure to set the new offset
-  TmpOffset = NewEnd;
-
-  return NewBase;
-}
-
 template<typename Res>
-Res InterpreterCore::GetDest(IR::OrderedNodeWrapper Op) {
-  auto DstPtr = &TmpSpace.at(DestMap[Op.ID()]);
+Res InterpreterCore::GetDest(void* SSAData, IR::OrderedNodeWrapper Op) {
+  auto DstPtr = &reinterpret_cast<__uint128_t*>(SSAData)[Op.ID()];
   return reinterpret_cast<Res>(DstPtr);
 }
 
 template<typename Res>
-Res InterpreterCore::GetSrc(IR::OrderedNodeWrapper Src) {
-#if DESTMAP_AS_MAP
-  LogMan::Throw::A(DestMap.find(Src.ID()) != DestMap.end(), "Op had source but it wasn't in the destination map");
-#endif
-
-  auto DstPtr = &TmpSpace.at(DestMap[Src.ID()]);
-  LogMan::Throw::A(DstPtr != nullptr, "Destmap had slot but didn't get allocated memory");
+Res InterpreterCore::GetSrc(void* SSAData, IR::OrderedNodeWrapper Src) {
+  auto DstPtr = &reinterpret_cast<__uint128_t*>(SSAData)[Src.ID()];
   return reinterpret_cast<Res>(DstPtr);
 }
 
@@ -114,45 +82,38 @@ void *InterpreterCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true
 }
 
 void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
+  volatile void* stack = alloca(0);
   auto IR = Thread->IRLists.find(Thread->State.State.rip);
-  CurrentIR = IR->second.get();
+  auto CurrentIR = IR->second.get();
 
-  TmpOffset = 0; // Reset where we are in the temp data range
+  uintptr_t ListSize = CurrentIR->GetSSACount();
 
   uintptr_t ListBegin = CurrentIR->GetListData();
   uintptr_t DataBegin = CurrentIR->GetData();
 
-#if DESTMAP_AS_MAP
-  DestMap.clear();
-#else
-  uintptr_t ListSize = CurrentIR->GetSSACount();
-  if (ListSize > DestMap.size()) {
-    DestMap.resize(std::max(DestMap.size() * 2, ListSize));
-  }
-#endif
-
   static_assert(sizeof(FEXCore::IR::IROp_Header) == 4);
   static_assert(sizeof(FEXCore::IR::OrderedNode) == 16);
 
-  auto HeaderIterator = CurrentIR->begin();
-  IR::OrderedNodeWrapper *HeaderNodeWrapper = HeaderIterator();
-  IR::OrderedNode *HeaderNode = HeaderNodeWrapper->GetNode(ListBegin);
-  auto HeaderOp = HeaderNode->Op(DataBegin)->CW<FEXCore::IR::IROp_IRHeader>();
-  LogMan::Throw::A(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
+  auto BlockIterator = CurrentIR->GetBlocks().begin();
+  auto BlockEnd = CurrentIR->GetBlocks().end();
 
-  IR::OrderedNode const *BlockNode = HeaderOp->Blocks.GetNode(ListBegin);
+  // Allocate 16 bytes per SSA
+  void *SSAData = alloca(ListSize * 16);
 
-#define GD *GetDest<uint64_t*>(*WrapperOp)
-#define GDP GetDest<void*>(*WrapperOp)
+  // Clear them all to zero. Required for Zero-extend semantics
+  memset(SSAData, 0, ListSize * 16);
+
+#define GD *GetDest<uint64_t*>(SSAData, WrapperOp)
+#define GDP GetDest<void*>(SSAData, WrapperOp)
   auto GetOpSize = [&](IR::OrderedNodeWrapper Node) {
-    FEXCore::IR::OrderedNode const *RealNode = Node.GetNode(ListBegin);
-    FEXCore::IR::IROp_Header const *IROp = RealNode->Op(DataBegin);
+    auto IROp = CurrentIR->GetOp<FEXCore::IR::IROp_Header>(Node);
     return IROp->Size;
   };
 
   while (1) {
     using namespace FEXCore::IR;
-    auto BlockIROp = BlockNode->Op(DataBegin)->C<FEXCore::IR::IROp_CodeBlock>();
+    auto [BlockNode, BlockHeader] = BlockIterator();
+    auto BlockIROp = BlockHeader->CW<IROp_CodeBlock>();
     LogMan::Throw::A(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
 
     // We grab these nodes this way so we can iterate easily
@@ -163,29 +124,34 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
       bool Redo;
     } BlockResults{};
 
-    auto HandleBlock = [&]() {
-      while (1) {
-        OrderedNodeWrapper *WrapperOp = CodeBegin();
-        OrderedNode *RealNode = WrapperOp->GetNode(ListBegin);
-        FEXCore::IR::IROp_Header *IROp = RealNode->Op(DataBegin);
+    auto HandleBlock = [&](OrderedNode *BlockNode) {
+      for (auto [CodeNode, IROp] : CurrentIR->GetCode(BlockNode)) {
+        OrderedNodeWrapper WrapperOp = CodeNode->Wrapped(ListBegin);
         uint8_t OpSize = IROp->Size;
-        uint32_t Node = WrapperOp->ID();
-
-        if (IROp->HasDest) {
-          DestMap[Node] = AllocateTmpSpace(OpSize);
-          // Clear any previous results
-          memset(GDP, 0, 16);
-        }
+        uint32_t Node = CurrentIR->GetID(CodeNode);
 
         switch (IROp->Op) {
-          case IR::OP_DUMMY:
-          case IR::OP_BEGINBLOCK:
-            break;
-          case IR::OP_ENDBLOCK: {
-            auto Op = IROp->C<IR::IROp_EndBlock>();
-            Thread->State.State.rip += Op->RIPIncrement;
+          case IR::OP_VALIDATECODE: {
+            auto Op = IROp->C<IR::IROp_ValidateCode>();
+
+            if (memcmp((void*)Op->CodePtr, &Op->CodeOriginal, Op->CodeLength) != 0) {
+              GD = 1;
+            } else {
+              GD = 0;
+            }
             break;
           }
+          
+          case IR::OP_REMOVECODEENTRY: {
+            auto Op = IROp->C<IR::IROp_RemoveCodeEntry>();
+            CTX->RemoveCodeEntry(Thread, Op->RIP);
+            break;
+          }
+
+          case IR::OP_DUMMY:
+          case IR::OP_BEGINBLOCK:
+          case IR::OP_ENDBLOCK:
+            break;
           case IR::OP_FENCE: {
             auto Op = IROp->C<IR::IROp_Fence>();
             switch (Op->Fence) {
@@ -208,12 +174,12 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             break;
           case IR::OP_CONDJUMP: {
             auto Op = IROp->C<IR::IROp_CondJump>();
-            uint64_t Arg = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Arg = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
             if (!!Arg) {
-              BlockNode = Op->Header.Args[1].GetNode(ListBegin);
+              BlockIterator = NodeIterator(ListBegin, DataBegin, Op->Header.Args[1]);
             }
             else  {
-              BlockNode = Op->Header.Args[2].GetNode(ListBegin);
+              BlockIterator = NodeIterator(ListBegin, DataBegin, Op->Header.Args[2]);
             }
             BlockResults.Redo = true;
             return;
@@ -221,7 +187,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_JUMP: {
             auto Op = IROp->C<IR::IROp_Jump>();
-            BlockNode = Op->Header.Args[0].GetNode(ListBegin);
+            BlockIterator = NodeIterator(ListBegin, DataBegin, Op->Header.Args[0]);
             BlockResults.Redo = true;
             return;
             break;
@@ -240,13 +206,17 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             SignalReturn(State);
             break;
           }
+          case IR::OP_CALLBACKRETURN: {
+            ReturnPtr(State, stack);
+            break;
+          }
           case IR::OP_SYSCALL: {
             auto Op = IROp->C<IR::IROp_Syscall>();
 
             FEXCore::HLE::SyscallArguments Args;
             for (size_t j = 0; j < FEXCore::HLE::SyscallArguments::MAX_ARGS; ++j) {
               if (Op->Header.Args[j].IsInvalid()) break;
-              Args.Argument[j] = *GetSrc<uint64_t*>(Op->Header.Args[j]);
+              Args.Argument[j] = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[j]);
             }
 
             uint64_t Res = FEXCore::HandleSyscall(CTX->SyscallHandler.get(), Thread, &Args);
@@ -258,14 +228,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
             //LogMan::Msg::D("Thunk function: %s, %p, %p\n", Op->ThunkName, Op->ThunkFnPtr, *GetSrc<void**>(Op->Header.Args[0]));
 
-            reinterpret_cast<ThunkedFunction*>(Op->ThunkFnPtr)(CTX, *GetSrc<void**>(Op->Header.Args[0]));
+            reinterpret_cast<ThunkedFunction*>(Op->ThunkFnPtr)(CTX, *GetSrc<void**>(SSAData, Op->Header.Args[0]));
 
             break;
           }
           case IR::OP_CPUID: {
             auto Op = IROp->C<IR::IROp_CPUID>();
-            uint64_t *DstPtr = GetDest<uint64_t*>(*WrapperOp);
-            uint64_t Arg = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t *DstPtr = GetDest<uint64_t*>(SSAData, WrapperOp);
+            uint64_t Arg = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
 
             auto Results = CTX->CPUID.RunFunction(Arg);
             memcpy(DstPtr, &Results, sizeof(uint32_t) * 4);
@@ -275,11 +245,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             auto Op = IROp->C<IR::IROp_Print>();
 
             if (OpSize <= 8) {
-              uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+              uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
               LogMan::Msg::I(">>>> Value in Arg: 0x%lx, %ld", Src, Src);
             }
             else if (OpSize == 16) {
-              __uint128_t Src = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+              __uint128_t Src = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
               uint64_t Src0 = Src;
               uint64_t Src1 = Src >> 64;
               LogMan::Msg::I(">>>> Value[0] in Arg: 0x%lx, %ld", Src0, Src0);
@@ -301,17 +271,17 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_MOV: {
             auto Op = IROp->C<IR::IROp_Mov>();
-            memcpy(GDP, GetSrc<void*>(Op->Header.Args[0]), OpSize);
+            memcpy(GDP, GetSrc<void*>(SSAData, Op->Header.Args[0]), OpSize);
             break;
           }
           case IR::OP_VBITCAST: {
             auto Op = IROp->C<IR::IROp_VBitcast>();
-            memcpy(GDP, GetSrc<void*>(Op->Header.Args[0]), 16);
+            memcpy(GDP, GetSrc<void*>(SSAData, Op->Header.Args[0]), 16);
             break;
           }
           case IR::OP_VCASTFROMGPR: {
             auto Op = IROp->C<IR::IROp_VCastFromGPR>();
-            memcpy(GDP, GetSrc<void*>(Op->Header.Args[0]), Op->Header.ElementSize);
+            memcpy(GDP, GetSrc<void*>(SSAData, Op->Header.Args[0]), Op->Header.ElementSize);
             break;
           }
           case IR::OP_VEXTRACTTOGPR: {
@@ -326,7 +296,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               if (Op->Header.ElementSize == 8)
                 SourceMask = ~0ULL;
 
-              __uint128_t Src = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+              __uint128_t Src = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
               Src >>= Shift;
               Src &= SourceMask;
               memcpy(GDP, &Src, Op->Header.ElementSize);
@@ -337,7 +307,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               if (Op->Header.ElementSize == 8)
                 SourceMask = ~0ULL;
 
-              uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+              uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
               Src >>= Shift;
               Src &= SourceMask;
               GD = Src;
@@ -346,14 +316,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VEXTRACTELEMENT: {
             auto Op = IROp->C<IR::IROp_VExtractElement>();
+            uint32_t SourceSize = GetOpSize(Op->Header.Args[0]);
             LogMan::Throw::A(OpSize <= 16, "OpSize is too large for VExtractToGPR: %d", OpSize);
-            if (OpSize == 16) {
+            if (SourceSize == 16) {
               __uint128_t SourceMask = (1ULL << (Op->Header.ElementSize * 8)) - 1;
               uint64_t Shift = Op->Header.ElementSize * Op->Index * 8;
               if (Op->Header.ElementSize == 8)
                 SourceMask = ~0ULL;
 
-              __uint128_t Src = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+              __uint128_t Src = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
               Src >>= Shift;
               Src &= SourceMask;
               memcpy(GDP, &Src, Op->Header.ElementSize);
@@ -364,7 +335,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               if (Op->Header.ElementSize == 8)
                 SourceMask = ~0ULL;
 
-              uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+              uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
               Src >>= Shift;
               Src &= SourceMask;
               GD = Src;
@@ -404,7 +375,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_LOADCONTEXTINDEXED: {
             auto Op = IROp->C<IR::IROp_LoadContextIndexed>();
-            uint64_t Index = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Index = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
 
             uintptr_t ContextPtr = reinterpret_cast<uintptr_t>(&Thread->State.State);
             ContextPtr += Op->BaseOffset;
@@ -438,20 +409,20 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             ContextPtr += Op->Offset;
 
             void *Data = reinterpret_cast<void*>(ContextPtr);
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             memcpy(Data, Src, OpSize);
             break;
           }
           case IR::OP_STORECONTEXTINDEXED: {
             auto Op = IROp->C<IR::IROp_StoreContextIndexed>();
-            uint64_t Index = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Index = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             uintptr_t ContextPtr = reinterpret_cast<uintptr_t>(&Thread->State.State);
             ContextPtr += Op->BaseOffset;
             ContextPtr += Index * Op->Stride;
 
             void *Data = reinterpret_cast<void*>(ContextPtr);
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             memcpy(Data, Src, Op->Size);
             break;
           }
@@ -472,14 +443,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             ContextPtr += Op->Offset;
 
             void *Data = reinterpret_cast<void*>(ContextPtr);
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             memcpy(Data, Src, Op->Size * 2);
             break;
           }
           case IR::OP_CREATEELEMENTPAIR: {
             auto Op = IROp->C<IR::IROp_CreateElementPair>();
-            void *Src_Lower = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src_Upper = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src_Lower = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src_Upper = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             memcpy(GDP, Src_Lower, Op->Header.Size);
             memcpy(reinterpret_cast<void*>(reinterpret_cast<uint64_t>(GDP) + Op->Header.Size),
@@ -488,7 +459,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_EXTRACTELEMENTPAIR: {
             auto Op = IROp->C<IR::IROp_ExtractElementPair>();
-            uintptr_t Src = GetSrc<uintptr_t>(Op->Header.Args[0]);
+            uintptr_t Src = GetSrc<uintptr_t>(SSAData, Op->Header.Args[0]);
             memcpy(GDP,
               reinterpret_cast<void*>(Src + Op->Header.Size * Op->Element), Op->Header.Size);
             break;
@@ -501,15 +472,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = GetSrc<std::atomic<uint64_t> *>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
                 uint64_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -519,15 +490,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<__uint128_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = GetSrc<std::atomic<__uint128_t> *>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<__uint128_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<__uint128_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<__uint128_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-                __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+                __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+                __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
                 __uint128_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -543,7 +514,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
             switch (Op->Size) {
               case 4: {
-                uint64_t *Src = GetSrc<uint64_t*>(Op->Header.Args[0]);
+                uint64_t *Src = GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
                 uint64_t Result{};
                 Result = Src[0] & ~0U;
                 Result |= Src[1] << 32;
@@ -566,7 +537,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_STOREFLAG: {
             auto Op = IROp->C<IR::IROp_StoreFlag>();
-            uint8_t Arg = *GetSrc<uint8_t*>(Op->Header.Args[0]) & 1;
+            uint8_t Arg = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]) & 1;
 
             uintptr_t ContextPtr = reinterpret_cast<uintptr_t>(&Thread->State.State);
             ContextPtr += offsetof(FEXCore::Core::CPUState, flags[0]);
@@ -580,11 +551,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             auto Op = IROp->C<IR::IROp_LoadMem>();
             void const *Data{};
             if (Thread->CTX->Config.UnifiedMemory) {
-              Data = *GetSrc<void const**>(Op->Header.Args[0]);
+              Data = *GetSrc<void const**>(SSAData, Op->Header.Args[0]);
             }
             else {
-              Data = Thread->CTX->MemoryMapper.GetPointer<void const*>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-              LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+              Data = Thread->CTX->MemoryMapper.GetPointer<void const*>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+              LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
             }
             memcpy(GDP, Data, OpSize);
             break;
@@ -593,14 +564,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             auto Op = IROp->C<IR::IROp_VLoadMemElement>();
             void const *Data{};
             if (Thread->CTX->Config.UnifiedMemory) {
-              Data = *GetSrc<void const**>(Op->Header.Args[0]);
+              Data = *GetSrc<void const**>(SSAData, Op->Header.Args[0]);
             }
             else {
-              Data = Thread->CTX->MemoryMapper.GetPointer<void const*>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-              LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+              Data = Thread->CTX->MemoryMapper.GetPointer<void const*>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+              LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
             }
 
-            memcpy(GDP, GetSrc<void*>(Op->Header.Args[1]), 16);
+            memcpy(GDP, GetSrc<void*>(SSAData, Op->Header.Args[1]), 16);
             memcpy(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GDP) + (Op->Header.ElementSize * Op->Index)),
               Data, Op->Header.ElementSize);
             break;
@@ -611,13 +582,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case x: { \
                 y *Data{}; \
                 if (Thread->CTX->Config.UnifiedMemory) { \
-                  Data = *GetSrc<y**>(Op->Header.Args[0]); \
+                  Data = *GetSrc<y**>(SSAData, Op->Header.Args[0]); \
                 } \
                 else { \
-                  Data = Thread->CTX->MemoryMapper.GetPointer<y*>(*GetSrc<uint64_t*>(Op->Header.Args[0])); \
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0])); \
+                  Data = Thread->CTX->MemoryMapper.GetPointer<y*>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0])); \
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0])); \
                 } \
-                memcpy(Data, GetSrc<y*>(Op->Header.Args[1]), sizeof(y)); \
+                memcpy(Data, GetSrc<y*>(SSAData, Op->Header.Args[1]), sizeof(y)); \
                 break; \
               }
 
@@ -631,14 +602,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 16: {
                 void *Data{};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<void**>(Op->Header.Args[0]);
+                  Data = *GetSrc<void**>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<void*>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<void*>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
 
-                void *Src = GetSrc<void*>(Op->Header.Args[1]);
+                void *Src = GetSrc<void*>(SSAData, Op->Header.Args[1]);
                 memcpy(Data, Src, 16);
                 break;
               }
@@ -652,13 +623,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case x: { \
                 y *Data{}; \
                 if (Thread->CTX->Config.UnifiedMemory) { \
-                  Data = *GetSrc<y**>(Op->Header.Args[0]); \
+                  Data = *GetSrc<y**>(SSAData, Op->Header.Args[0]); \
                 } \
                 else { \
-                  Data = Thread->CTX->MemoryMapper.GetPointer<y*>(*GetSrc<uint64_t*>(Op->Header.Args[0])); \
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0])); \
+                  Data = Thread->CTX->MemoryMapper.GetPointer<y*>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0])); \
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0])); \
                 } \
-                memcpy(Data, &GetSrc<y*>(Op->Header.Args[1])[Op->Index], sizeof(y)); \
+                memcpy(Data, &GetSrc<y*>(SSAData, Op->Header.Args[1])[Op->Index], sizeof(y)); \
                 break; \
               }
 
@@ -685,8 +656,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_ADD: {
             auto Op = IROp->C<IR::IROp_Add>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             auto Func = [](auto a, auto b) { return a + b; };
 
             switch (OpSize) {
@@ -698,8 +669,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_SUB: {
             auto Op = IROp->C<IR::IROp_Sub>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             auto Func = [](auto a, auto b) { return a - b; };
 
             switch (OpSize) {
@@ -711,7 +682,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_NEG: {
             auto Op = IROp->C<IR::IROp_Neg>();
-            uint64_t Src = *GetSrc<int64_t*>(Op->Header.Args[0]);
+            uint64_t Src = *GetSrc<int64_t*>(SSAData, Op->Header.Args[0]);
             switch (OpSize) {
               case 4:
                 GD = -static_cast<int32_t>(Src);
@@ -725,8 +696,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_OR: {
             auto Op = IROp->C<IR::IROp_Or>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             auto Func = [](auto a, auto b) { return a | b; };
 
             switch (OpSize) {
@@ -741,8 +712,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_AND: {
             auto Op = IROp->C<IR::IROp_And>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             auto Func = [](auto a, auto b) { return a & b; };
 
             switch (OpSize) {
@@ -756,8 +727,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_XOR: {
             auto Op = IROp->C<IR::IROp_Xor>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             auto Func = [](auto a, auto b) { return a ^ b; };
 
             switch (OpSize) {
@@ -771,8 +742,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_LSHL: {
             auto Op = IROp->C<IR::IROp_Lshl>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             uint8_t Mask = OpSize * 8 - 1;
             switch (OpSize) {
               case 4:
@@ -787,29 +758,29 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_LSHR: {
             auto Op = IROp->C<IR::IROp_Lshr>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             uint8_t Mask = OpSize * 8 - 1;
             GD = Src1 >> (Src2 & Mask);
             break;
           }
           case IR::OP_ASHR: {
             auto Op = IROp->C<IR::IROp_Ashr>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             uint8_t Mask = OpSize * 8 - 1;
             switch (OpSize) {
               case 1:
-                GD = static_cast<int8_t>(Src1) >> (Src2 & Mask);
+                GD = (uint8_t)(static_cast<int8_t>(Src1) >> (Src2 & Mask));
                 break;
               case 2:
-                GD = static_cast<int16_t>(Src1) >> (Src2 & Mask);
+                GD = (uint16_t)(static_cast<int16_t>(Src1) >> (Src2 & Mask));
                 break;
               case 4:
-                GD = static_cast<int32_t>(Src1) >> (Src2 & Mask);
+                GD = (uint32_t)(static_cast<int32_t>(Src1) >> (Src2 & Mask));
                 break;
               case 8:
-                GD = static_cast<int64_t>(Src1) >> (Src2 & Mask);
+                GD = (uint64_t)(static_cast<int64_t>(Src1) >> (Src2 & Mask));
                 break;
               default: LogMan::Msg::A("Unknown ASHR Size: %d\n", OpSize); break;
             };
@@ -817,8 +788,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_ROR: {
             auto Op = IROp->C<IR::IROp_Ror>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             auto Ror = [] (auto In, auto R) {
             auto RotateMask = sizeof(In) * 8 - 1;
               R &= RotateMask;
@@ -845,8 +816,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_ROL: {
             auto Op = IROp->C<IR::IROp_Rol>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             auto Rol = [] (auto In, auto R) {
             auto RotateMask = sizeof(In) * 8 - 1;
               R &= RotateMask;
@@ -871,9 +842,34 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             }
             break;
           }
+          case IR::OP_EXTR: {
+            auto Op = IROp->C<IR::IROp_Extr>();
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
+            auto Extr = [] (auto Src1, auto Src2, uint8_t lsb) -> decltype(Src1) {
+              __uint128_t Result{};
+              Result = Src1;
+              Result <<= sizeof(Src1) * 8;
+              Result |= Src2;
+              Result >>= lsb;
+              return Result;
+            };
+
+            switch (OpSize) {
+              case 4:
+                GD = Extr(static_cast<uint32_t>(Src1), static_cast<uint32_t>(Src2), Op->LSB);
+                break;
+              case 8: {
+                GD = Extr(static_cast<uint64_t>(Src1), static_cast<uint64_t>(Src2), Op->LSB);
+                break;
+              }
+              default: LogMan::Msg::A("Unknown EXTR Size: %d\n", OpSize); break;
+            }
+            break;
+          }
           case IR::OP_NOT: {
             auto Op = IROp->C<IR::IROp_Not>();
-            uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
             const uint64_t mask[9]= { 0, 0xFF, 0xFFFF, 0, 0xFFFFFFFF, 0, 0, 0, 0xFFFFFFFFFFFFFFFFULL };
             uint64_t Mask = mask[OpSize];
             GD = (~Src) & Mask;
@@ -884,16 +880,16 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             LogMan::Throw::A(Op->SrcSize <= 64, "Can't support Zext of size: %ld", Op->SrcSize);
             switch (Op->SrcSize / 8) {
               case 1:
-                GD = *GetSrc<int8_t*>(Op->Header.Args[0]);
+                GD = *GetSrc<int8_t*>(SSAData, Op->Header.Args[0]);
                 break;
               case 2:
-                GD = *GetSrc<int16_t*>(Op->Header.Args[0]);
+                GD = *GetSrc<int16_t*>(SSAData, Op->Header.Args[0]);
                 break;
               case 4:
-                GD = *GetSrc<int32_t*>(Op->Header.Args[0]);
+                GD = *GetSrc<int32_t*>(SSAData, Op->Header.Args[0]);
                 break;
               case 8:
-                GD = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+                GD = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
                 break;
               default: LogMan::Msg::A("Unknown Sext size: %d", Op->SrcSize / 8);
             }
@@ -901,8 +897,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_MUL: {
             auto Op = IROp->C<IR::IROp_Mul>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -928,8 +924,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_MULH: {
             auto Op = IROp->C<IR::IROp_MulH>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1: {
@@ -958,8 +954,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_UMUL: {
             auto Op = IROp->C<IR::IROp_UMul>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -985,8 +981,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_UMULH: {
             auto Op = IROp->C<IR::IROp_UMulH>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             switch (OpSize) {
               case 1:
                 GD = static_cast<uint16_t>(Src1) * static_cast<uint16_t>(Src2);
@@ -1017,8 +1013,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_DIV: {
             auto Op = IROp->C<IR::IROp_Div>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -1034,7 +1030,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 GD = static_cast<int64_t>(Src1) / static_cast<int64_t>(Src2);
                 break;
               case 16: {
-                __int128_t Tmp = *GetSrc<__int128_t*>(Op->Header.Args[0]) / *GetSrc<__int128_t*>(Op->Header.Args[1]);
+                __int128_t Tmp = *GetSrc<__int128_t*>(SSAData, Op->Header.Args[0]) / *GetSrc<__int128_t*>(SSAData, Op->Header.Args[1]);
                 memcpy(GDP, &Tmp, 16);
                 break;
               }
@@ -1044,8 +1040,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_UDIV: {
             auto Op = IROp->C<IR::IROp_UDiv>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -1061,7 +1057,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 GD = static_cast<uint64_t>(Src1) / static_cast<uint64_t>(Src2);
                 break;
               case 16: {
-                __uint128_t Tmp = *GetSrc<__uint128_t*>(Op->Header.Args[0]) / *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+                __uint128_t Tmp = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]) / *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
                 memcpy(GDP, &Tmp, 16);
                 break;
               }
@@ -1071,8 +1067,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_REM: {
             auto Op = IROp->C<IR::IROp_Rem>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -1088,7 +1084,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 GD = static_cast<int64_t>(Src1) % static_cast<int64_t>(Src2);
                 break;
               case 16: {
-                __int128_t Tmp = *GetSrc<__int128_t*>(Op->Header.Args[0]) % *GetSrc<__int128_t*>(Op->Header.Args[1]);
+                __int128_t Tmp = *GetSrc<__int128_t*>(SSAData, Op->Header.Args[0]) % *GetSrc<__int128_t*>(SSAData, Op->Header.Args[1]);
                 memcpy(GDP, &Tmp, 16);
                 break;
               }
@@ -1098,8 +1094,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_UREM: {
             auto Op = IROp->C<IR::IROp_URem>();
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
             switch (OpSize) {
               case 1:
@@ -1115,7 +1111,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 GD = static_cast<uint64_t>(Src1) % static_cast<uint64_t>(Src2);
                 break;
               case 16: {
-                __uint128_t Tmp = *GetSrc<__uint128_t*>(Op->Header.Args[0]) % *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+                __uint128_t Tmp = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]) % *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
                 memcpy(GDP, &Tmp, 16);
                 break;
               }
@@ -1125,13 +1121,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_POPCOUNT: {
             auto Op = IROp->C<IR::IROp_Popcount>();
-            uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
             GD = __builtin_popcountl(Src);
             break;
           }
           case IR::OP_FINDLSB: {
             auto Op = IROp->C<IR::IROp_FindLSB>();
-            uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
             uint64_t Result = __builtin_ffsll(Src);
             GD = Result - 1;
             break;
@@ -1139,10 +1135,10 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_FINDMSB: {
             auto Op = IROp->C<IR::IROp_FindMSB>();
             switch (OpSize) {
-              case 1: GD = ((24 + OpSize * 8) - __builtin_clz(*GetSrc<uint8_t*>(Op->Header.Args[0]))) - 1; break;
-              case 2: GD = ((16 + OpSize * 8) - __builtin_clz(*GetSrc<uint16_t*>(Op->Header.Args[0]))) - 1; break;
-              case 4: GD = (OpSize * 8 - __builtin_clz(*GetSrc<uint32_t*>(Op->Header.Args[0]))) - 1; break;
-              case 8: GD = (OpSize * 8 - __builtin_clzll(*GetSrc<uint64_t*>(Op->Header.Args[0]))) - 1; break;
+              case 1: GD = ((24 + OpSize * 8) - __builtin_clz(*GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]))) - 1; break;
+              case 2: GD = ((16 + OpSize * 8) - __builtin_clz(*GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]))) - 1; break;
+              case 4: GD = (OpSize * 8 - __builtin_clz(*GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]))) - 1; break;
+              case 8: GD = (OpSize * 8 - __builtin_clzll(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]))) - 1; break;
               default: LogMan::Msg::A("Unknown REV size: %d", OpSize); break;
             }
             break;
@@ -1150,9 +1146,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_REV: {
             auto Op = IROp->C<IR::IROp_Rev>();
             switch (OpSize) {
-              case 2: GD = __builtin_bswap16(*GetSrc<uint16_t*>(Op->Header.Args[0])); break;
-              case 4: GD = __builtin_bswap32(*GetSrc<uint32_t*>(Op->Header.Args[0])); break;
-              case 8: GD = __builtin_bswap64(*GetSrc<uint64_t*>(Op->Header.Args[0])); break;
+              case 2: GD = __builtin_bswap16(*GetSrc<uint16_t*>(SSAData, Op->Header.Args[0])); break;
+              case 4: GD = __builtin_bswap32(*GetSrc<uint32_t*>(SSAData, Op->Header.Args[0])); break;
+              case 8: GD = __builtin_bswap64(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0])); break;
               default: LogMan::Msg::A("Unknown REV size: %d", OpSize); break;
             }
             break;
@@ -1161,7 +1157,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             auto Op = IROp->C<IR::IROp_FindTrailingZeros>();
             switch (OpSize) {
               case 1: {
-                auto Src = *GetSrc<uint8_t*>(Op->Header.Args[0]);
+                auto Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]);
                 if (Src)
                   GD = __builtin_ctz(Src);
                 else
@@ -1169,7 +1165,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 2: {
-                auto Src = *GetSrc<uint16_t*>(Op->Header.Args[0]);
+                auto Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
                 if (Src)
                   GD = __builtin_ctz(Src);
                 else
@@ -1177,7 +1173,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 4: {
-                auto Src = *GetSrc<uint32_t*>(Op->Header.Args[0]);
+                auto Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
                 if (Src)
                   GD = __builtin_ctz(Src);
                 else
@@ -1185,7 +1181,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 8: {
-                auto Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+                auto Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
                 if (Src)
                   GD = __builtin_ctzll(Src);
                 else
@@ -1202,8 +1198,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             if (Op->Width == 64)
               SourceMask = ~0ULL;
             uint64_t DestMask = ~(SourceMask << Op->lsb);
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
             uint64_t Res = (Src1 & DestMask) | ((Src2 & SourceMask) << Op->lsb);
             GD = Res;
             break;
@@ -1211,7 +1207,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_SBFE: {
             auto Op = IROp->C<IR::IROp_Sbfe>();
             LogMan::Throw::A(OpSize < 16, "OpSize is too large for BFE: %d", OpSize);
-            int64_t Src = *GetSrc<int64_t*>(Op->Header.Args[0]);
+            int64_t Src = *GetSrc<int64_t*>(SSAData, Op->Header.Args[0]);
             uint64_t ShiftLeftAmount = (64 - (Op->Width + Op->lsb));
             uint64_t ShiftRightAmount = ShiftLeftAmount + Op->lsb;
             Src <<= ShiftLeftAmount;
@@ -1226,18 +1222,18 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             if (Op->Width == 64)
               SourceMask = ~0ULL;
             SourceMask <<= Op->lsb;
-            uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[0]);
+            uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
             GD = (Src & SourceMask) >> Op->lsb;
             break;
           }
           case IR::OP_SELECT: {
             auto Op = IROp->C<IR::IROp_Select>();
             bool CompResult = false;
-            uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-            uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+            uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+            uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
-            uint64_t ArgTrue = *GetSrc<uint64_t*>(Op->Header.Args[2]);
-            uint64_t ArgFalse = *GetSrc<uint64_t*>(Op->Header.Args[3]);
+            uint64_t ArgTrue = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]);
+            uint64_t ArgFalse = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[3]);
 
             switch (Op->Cond.Val) {
               case FEXCore::IR::COND_EQ:
@@ -1288,15 +1284,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                uint8_t Src1 = *GetSrc<uint8_t*>(Op->Header.Args[0]);
-                uint8_t Src2 = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src1 = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]);
+                uint8_t Src2 = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
 
                 uint8_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -1306,15 +1302,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                uint16_t Src1 = *GetSrc<uint16_t*>(Op->Header.Args[0]);
-                uint16_t Src2 = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src1 = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
+                uint16_t Src2 = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
 
                 uint16_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -1324,15 +1320,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                uint32_t Src1 = *GetSrc<uint32_t*>(Op->Header.Args[0]);
-                uint32_t Src2 = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src1 = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
+                uint32_t Src2 = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
 
                 uint32_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -1342,15 +1338,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[2]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[2]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[2]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[2]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]));
                 }
 
-                uint64_t Src1 = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t Src2 = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src1 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t Src2 = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
 
                 uint64_t Expected = Src1;
                 bool Result = Data->compare_exchange_strong(Expected, Src2);
@@ -1367,54 +1363,54 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
 
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 *Data += Src;
                 break;
               }
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(Op->Header.Args[0]));
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]));
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 *Data += Src;
                 break;
               }
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 *Data += Src;
                 break;
               }
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 *Data += Src;
                 break;
               }
@@ -1428,52 +1424,52 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 *Data -= Src;
                 break;
               }
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 *Data -= Src;
                 break;
               }
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 *Data -= Src;
                 break;
               }
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 *Data -= Src;
                 break;
               }
@@ -1487,52 +1483,52 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 *Data &= Src;
                 break;
               }
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 *Data &= Src;
                 break;
               }
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 *Data &= Src;
                 break;
               }
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 *Data &= Src;
                 break;
               }
@@ -1546,54 +1542,54 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint8_t*>(Op->Header.Args[0]));
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]));
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 *Data |= Src;
                 break;
               }
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(Op->Header.Args[0]));
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]));
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 *Data |= Src;
                 break;
               }
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 *Data |= Src;
                 break;
               }
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 *Data |= Src;
                 break;
               }
@@ -1607,53 +1603,53 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 *Data ^= Src;
                 break;
               }
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(Op->Header.Args[0]));
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]));
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 *Data ^= Src;
                 break;
               }
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 *Data ^= Src;
                 break;
               }
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 *Data ^= Src;
                 break;
               }
@@ -1667,13 +1663,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->exchange(Src);
                 GD = Previous;
                 break;
@@ -1681,13 +1677,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->exchange(Src);
                 GD = Previous;
                 break;
@@ -1695,13 +1691,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->exchange(Src);
                 GD = Previous;
                 break;
@@ -1709,13 +1705,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->exchange(Src);
                 GD = Previous;
                 break;
@@ -1730,13 +1726,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->fetch_add(Src);
                 GD = Previous;
                 break;
@@ -1744,13 +1740,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->fetch_add(Src);
                 GD = Previous;
                 break;
@@ -1758,13 +1754,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->fetch_add(Src);
                 GD = Previous;
                 break;
@@ -1772,13 +1768,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->fetch_add(Src);
                 GD = Previous;
                 break;
@@ -1793,13 +1789,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->fetch_sub(Src);
                 GD = Previous;
                 break;
@@ -1807,13 +1803,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->fetch_sub(Src);
                 GD = Previous;
                 break;
@@ -1821,13 +1817,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->fetch_sub(Src);
                 GD = Previous;
                 break;
@@ -1835,13 +1831,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->fetch_sub(Src);
                 GD = Previous;
                 break;
@@ -1856,13 +1852,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->fetch_and(Src);
                 GD = Previous;
                 break;
@@ -1870,13 +1866,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->fetch_and(Src);
                 GD = Previous;
                 break;
@@ -1884,13 +1880,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->fetch_and(Src);
                 GD = Previous;
                 break;
@@ -1898,13 +1894,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->fetch_and(Src);
                 GD = Previous;
                 break;
@@ -1919,13 +1915,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->fetch_or(Src);
                 GD = Previous;
                 break;
@@ -1933,13 +1929,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->fetch_or(Src);
                 GD = Previous;
                 break;
@@ -1947,13 +1943,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->fetch_or(Src);
                 GD = Previous;
                 break;
@@ -1961,13 +1957,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->fetch_or(Src);
                 GD = Previous;
                 break;
@@ -1982,13 +1978,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 1: {
                 std::atomic<uint8_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint8_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint8_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint8_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint8_t Src = *GetSrc<uint8_t*>(Op->Header.Args[1]);
+                uint8_t Src = *GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
                 uint8_t Previous = Data->fetch_xor(Src);
                 GD = Previous;
                 break;
@@ -1996,13 +1992,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 2: {
                 std::atomic<uint16_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint16_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint16_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint16_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint16_t Src = *GetSrc<uint16_t*>(Op->Header.Args[1]);
+                uint16_t Src = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
                 uint16_t Previous = Data->fetch_xor(Src);
                 GD = Previous;
                 break;
@@ -2010,13 +2006,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 4: {
                 std::atomic<uint32_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint32_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint32_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint32_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint32_t Src = *GetSrc<uint32_t*>(Op->Header.Args[1]);
+                uint32_t Src = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
                 uint32_t Previous = Data->fetch_xor(Src);
                 GD = Previous;
                 break;
@@ -2024,13 +2020,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               case 8: {
                 std::atomic<uint64_t> *Data = {};
                 if (Thread->CTX->Config.UnifiedMemory) {
-                  Data = *GetSrc<std::atomic<uint64_t> **>(Op->Header.Args[0]);
+                  Data = *GetSrc<std::atomic<uint64_t> **>(SSAData, Op->Header.Args[0]);
                 }
                 else {
-                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(Op->Header.Args[0]));
-                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(Op->Header.Args[0]));
+                  Data = Thread->CTX->MemoryMapper.GetPointer<std::atomic<uint64_t> *>(*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
+                  LogMan::Throw::A(Data != nullptr, "Couldn't Map pointer to 0x%lx\n", *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]));
                 }
-                uint64_t Src = *GetSrc<uint64_t*>(Op->Header.Args[1]);
+                uint64_t Src = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
                 uint64_t Previous = Data->fetch_xor(Src);
                 GD = Previous;
                 break;
@@ -2043,8 +2039,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_CREATEVECTOR2: {
             auto Op = IROp->C<IR::IROp_CreateVector2>();
             LogMan::Throw::A(OpSize <= 16, "Can't handle a vector of size: %d", OpSize);
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
             uint8_t ElementSize = OpSize / 2;
             #define CREATE_VECTOR(elementsize, type) \
@@ -2072,7 +2068,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_SPLATVECTOR2: {
             auto Op = IROp->C<IR::IROp_SplatVector2>();
             LogMan::Throw::A(OpSize <= 16, "Can't handle a vector of size: %d", OpSize);
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
             uint8_t Elements = 0;
 
@@ -2105,15 +2101,15 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VMOV: {
             auto Op = IROp->C<IR::IROp_VMov>();
-            __uint128_t Src = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+            __uint128_t Src = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
 
             memcpy(GDP, &Src, OpSize);
             break;
           }
           case IR::OP_VOR: {
             auto Op = IROp->C<IR::IROp_VOr>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             __uint128_t Dst = Src1 | Src2;
             memcpy(GDP, &Dst, 16);
@@ -2121,8 +2117,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VAND: {
             auto Op = IROp->C<IR::IROp_VAnd>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             __uint128_t Dst = Src1 & Src2;
             memcpy(GDP, &Dst, 16);
@@ -2130,8 +2126,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VXOR: {
             auto Op = IROp->C<IR::IROp_VXor>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             __uint128_t Dst = Src1 ^ Src2;
             memcpy(GDP, &Dst, 16);
@@ -2139,7 +2135,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSLI: {
             auto Op = IROp->C<IR::IROp_VSLI>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
             __uint128_t Src2 = Op->ByteShift * 8;
 
             __uint128_t Dst = Op->ByteShift >= sizeof(__uint128_t) ? 0 : Src1 << Src2;
@@ -2148,7 +2144,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSRI: {
             auto Op = IROp->C<IR::IROp_VSRI>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
             __uint128_t Src2 = Op->ByteShift * 8;
 
             __uint128_t Dst = Op->ByteShift >= sizeof(__uint128_t) ? 0 : Src1 >> Src2;
@@ -2157,7 +2153,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VNOT: {
             auto Op = IROp->C<IR::IROp_VNot>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
 
             __uint128_t Dst = ~Src1;
             memcpy(GDP, &Dst, 16);
@@ -2226,7 +2222,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             }
           case IR::OP_VFNEG: {
             auto Op = IROp->C<IR::IROp_VFNeg>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2242,7 +2238,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUSHRI: {
             auto Op = IROp->C<IR::IROp_VUShrI>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t BitShift = Op->BitShift;
             uint8_t Tmp[16];
 
@@ -2261,7 +2257,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSSHRI: {
             auto Op = IROp->C<IR::IROp_VSShrI>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t BitShift = Op->BitShift;
             uint8_t Tmp[16];
 
@@ -2280,7 +2276,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSHLI: {
             auto Op = IROp->C<IR::IROp_VShlI>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t BitShift = Op->BitShift;
             uint8_t Tmp[16];
 
@@ -2300,8 +2296,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VADD: {
             auto Op = IROp->C<IR::IROp_VAdd>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2319,8 +2315,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSUB: {
             auto Op = IROp->C<IR::IROp_VSub>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2338,8 +2334,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUQADD: {
             auto Op = IROp->C<IR::IROp_VUQAdd>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2360,8 +2356,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUQSUB: {
             auto Op = IROp->C<IR::IROp_VUQSub>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2382,8 +2378,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQADD: {
             auto Op = IROp->C<IR::IROp_VSQAdd>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2414,8 +2410,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQSUB: {
             auto Op = IROp->C<IR::IROp_VSQSub>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2443,8 +2439,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VFADD: {
             auto Op = IROp->C<IR::IROp_VFAdd>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2460,8 +2456,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFADDP: {
             auto Op = IROp->C<IR::IROp_VFAddP>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = (OpSize / Op->Header.ElementSize) / 2;
@@ -2477,8 +2473,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFSUB: {
             auto Op = IROp->C<IR::IROp_VFSub>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2494,8 +2490,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VADDP: {
             auto Op = IROp->C<IR::IROp_VAddP>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = (OpSize / Op->Header.ElementSize) / 2;
@@ -2513,7 +2509,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VADDV: {
             auto Op = IROp->C<IR::IROp_VAddV>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2531,8 +2527,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VURAVG: {
             auto Op = IROp->C<IR::IROp_VURAvg>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2548,7 +2544,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VABS: {
             auto Op = IROp->C<IR::IROp_VAbs>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2566,8 +2562,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFMUL: {
             auto Op = IROp->C<IR::IROp_VFMul>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2583,8 +2579,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFDIV: {
             auto Op = IROp->C<IR::IROp_VFDiv>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2600,8 +2596,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFMIN: {
             auto Op = IROp->C<IR::IROp_VFMin>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2617,8 +2613,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFMAX: {
             auto Op = IROp->C<IR::IROp_VFMax>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2634,7 +2630,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFRECP: {
             auto Op = IROp->C<IR::IROp_VFRecp>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2650,7 +2646,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFSQRT: {
             auto Op = IROp->C<IR::IROp_VFSqrt>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2666,7 +2662,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFRSQRT: {
             auto Op = IROp->C<IR::IROp_VFRSqrt>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2732,7 +2728,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VUSHRNI: {
             auto Op = IROp->C<IR::IROp_VUShrNI>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t BitShift = Op->BitShift;
             uint8_t Tmp[16]{};
 
@@ -2750,8 +2746,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUSHRNI2: {
             auto Op = IROp->C<IR::IROp_VUShrNI2>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t BitShift = Op->BitShift;
             uint8_t Tmp[16];
 
@@ -2769,7 +2765,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQXTN: {
             auto Op = IROp->C<IR::IROp_VSQXTN>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / (Op->Header.ElementSize << 1);
@@ -2785,8 +2781,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQXTN2: {
             auto Op = IROp->C<IR::IROp_VSQXTN2>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / (Op->Header.ElementSize << 1);
@@ -2802,7 +2798,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQXTUN: {
             auto Op = IROp->C<IR::IROp_VSQXTUN>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / (Op->Header.ElementSize << 1);
@@ -2818,8 +2814,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSQXTUN2: {
             auto Op = IROp->C<IR::IROp_VSQXTUN2>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / (Op->Header.ElementSize << 1);
@@ -2835,7 +2831,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VECTOR_UTOF: {
             auto Op = IROp->C<IR::IROp_Vector_UToF>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2851,7 +2847,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VECTOR_STOF: {
             auto Op = IROp->C<IR::IROp_Vector_SToF>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2867,7 +2863,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VECTOR_FTOZU: {
             auto Op = IROp->C<IR::IROp_Vector_FToZU>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2883,7 +2879,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VECTOR_FTOZS: {
             auto Op = IROp->C<IR::IROp_Vector_FToZS>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2899,8 +2895,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUMUL: {
             auto Op = IROp->C<IR::IROp_VUMul>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2918,8 +2914,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSMUL: {
             auto Op = IROp->C<IR::IROp_VSMul>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -2937,8 +2933,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUMULL: {
             auto Op = IROp->C<IR::IROp_VUMull>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             uint8_t Tmp[16];
 
@@ -2956,8 +2952,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSMULL: {
             auto Op = IROp->C<IR::IROp_VSMull>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             uint8_t Tmp[16];
 
@@ -2975,8 +2971,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUMULL2: {
             auto Op = IROp->C<IR::IROp_VUMull2>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             uint8_t Tmp[16];
 
@@ -2994,8 +2990,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSMULL2: {
             auto Op = IROp->C<IR::IROp_VSMull2>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             uint8_t Tmp[16];
 
@@ -3013,7 +3009,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSXTL: {
             auto Op = IROp->C<IR::IROp_VSXTL>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3030,7 +3026,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSXTL2: {
             auto Op = IROp->C<IR::IROp_VSXTL2>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3047,7 +3043,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUXTL: {
             auto Op = IROp->C<IR::IROp_VUXTL>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16]{};
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3064,7 +3060,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUXTL2: {
             auto Op = IROp->C<IR::IROp_VUXTL2>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
 
             uint8_t Tmp[16];
 
@@ -3082,8 +3078,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUMIN: {
             auto Op = IROp->C<IR::IROp_VUMin>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3101,8 +3097,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSMIN: {
             auto Op = IROp->C<IR::IROp_VSMin>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3120,8 +3116,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUMAX: {
             auto Op = IROp->C<IR::IROp_VUMax>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3139,8 +3135,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSMAX: {
             auto Op = IROp->C<IR::IROp_VSMax>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3158,8 +3154,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUSHL: {
             auto Op = IROp->C<IR::IROp_VUShl>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3177,8 +3173,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSSHR: {
             auto Op = IROp->C<IR::IROp_VSShr>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3197,8 +3193,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VUSHLS: {
             auto Op = IROp->C<IR::IROp_VUShlS>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3217,8 +3213,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUSHRS: {
             auto Op = IROp->C<IR::IROp_VUShrS>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3237,8 +3233,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VSSHRS: {
             auto Op = IROp->C<IR::IROp_VSShrS>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3257,8 +3253,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VUSHR: {
             auto Op = IROp->C<IR::IROp_VUShr>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3277,8 +3273,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_VZIP2:
           case IR::OP_VZIP: {
             auto Op = IROp->C<IR::IROp_VZip>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
             uint8_t Elements = OpSize / Op->Header.ElementSize;
             uint8_t BaseOffset = IROp->Op == IR::OP_VZIP2 ? (Elements / 2) : 0;
@@ -3333,8 +3329,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VINSELEMENT: {
             auto Op = IROp->C<IR::IROp_VInsElement>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             // Copy src1 in to dest
@@ -3371,8 +3367,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VINSSCALARELEMENT: {
             auto Op = IROp->C<IR::IROp_VInsScalarElement>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             // Copy src1 in to dest
@@ -3410,9 +3406,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VBSL: {
             auto Op = IROp->C<IR::IROp_VBSL>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
-            __uint128_t Src3 = *GetSrc<__uint128_t*>(Op->Header.Args[2]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
+            __uint128_t Src3 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[2]);
 
             __uint128_t Tmp{};
             Tmp = Src2 & Src1;
@@ -3423,8 +3419,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VCMPEQ: {
             auto Op = IROp->C<IR::IROp_VCMPEQ>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3443,8 +3439,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VCMPGT: {
             auto Op = IROp->C<IR::IROp_VCMPGT>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
             uint8_t Tmp[16];
 
             uint8_t Elements = OpSize / Op->Header.ElementSize;
@@ -3467,9 +3463,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             // So you can have up to a 128bit divide from x86-64
             switch (OpSize) {
               case 2: {
-                uint16_t SrcLow = *GetSrc<uint16_t*>(Op->Header.Args[0]);
-                uint16_t SrcHigh = *GetSrc<uint16_t*>(Op->Header.Args[1]);
-                uint16_t Divisor = *GetSrc<uint16_t*>(Op->Header.Args[2]);
+                uint16_t SrcLow = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
+                uint16_t SrcHigh = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
+                uint16_t Divisor = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[2]);
                 uint32_t Source = (static_cast<uint32_t>(SrcHigh) << 16) | SrcLow;
                 uint32_t Res = Source / Divisor;
 
@@ -3478,9 +3474,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 4: {
-                uint32_t SrcLow = *GetSrc<uint32_t*>(Op->Header.Args[0]);
-                uint32_t SrcHigh = *GetSrc<uint32_t*>(Op->Header.Args[1]);
-                uint32_t Divisor = *GetSrc<uint32_t*>(Op->Header.Args[2]);
+                uint32_t SrcLow = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
+                uint32_t SrcHigh = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
+                uint32_t Divisor = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[2]);
                 uint64_t Source = (static_cast<uint64_t>(SrcHigh) << 32) | SrcLow;
                 uint64_t Res = Source / Divisor;
 
@@ -3489,9 +3485,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 8: {
-                uint64_t SrcLow = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t SrcHigh = *GetSrc<uint64_t*>(Op->Header.Args[1]);
-                uint64_t Divisor = *GetSrc<uint64_t*>(Op->Header.Args[2]);
+                uint64_t SrcLow = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t SrcHigh = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
+                uint64_t Divisor = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]);
                 __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
                 __uint128_t Res = Source / Divisor;
 
@@ -3509,9 +3505,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             // So you can have up to a 128bit divide from x86-64
             switch (OpSize) {
               case 2: {
-                uint16_t SrcLow = *GetSrc<uint16_t*>(Op->Header.Args[0]);
-                uint16_t SrcHigh = *GetSrc<uint16_t*>(Op->Header.Args[1]);
-                int16_t Divisor = *GetSrc<uint16_t*>(Op->Header.Args[2]);
+                uint16_t SrcLow = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
+                uint16_t SrcHigh = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
+                int16_t Divisor = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[2]);
                 int32_t Source = (static_cast<uint32_t>(SrcHigh) << 16) | SrcLow;
                 int32_t Res = Source / Divisor;
 
@@ -3520,9 +3516,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 4: {
-                uint32_t SrcLow = *GetSrc<uint32_t*>(Op->Header.Args[0]);
-                uint32_t SrcHigh = *GetSrc<uint32_t*>(Op->Header.Args[1]);
-                int32_t Divisor = *GetSrc<uint32_t*>(Op->Header.Args[2]);
+                uint32_t SrcLow = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
+                uint32_t SrcHigh = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
+                int32_t Divisor = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[2]);
                 int64_t Source = (static_cast<uint64_t>(SrcHigh) << 32) | SrcLow;
                 int64_t Res = Source / Divisor;
 
@@ -3531,9 +3527,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 8: {
-                uint64_t SrcLow = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t SrcHigh = *GetSrc<uint64_t*>(Op->Header.Args[1]);
-                int64_t Divisor = *GetSrc<int64_t*>(Op->Header.Args[2]);
+                uint64_t SrcLow = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t SrcHigh = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
+                int64_t Divisor = *GetSrc<int64_t*>(SSAData, Op->Header.Args[2]);
                 __int128_t Source = (static_cast<__int128_t>(SrcHigh) << 64) | SrcLow;
                 __int128_t Res = Source / Divisor;
 
@@ -3551,9 +3547,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             // So you can have up to a 128bit Remainder from x86-64
             switch (OpSize) {
               case 2: {
-                uint16_t SrcLow = *GetSrc<uint16_t*>(Op->Header.Args[0]);
-                uint16_t SrcHigh = *GetSrc<uint16_t*>(Op->Header.Args[1]);
-                uint16_t Divisor = *GetSrc<uint16_t*>(Op->Header.Args[2]);
+                uint16_t SrcLow = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
+                uint16_t SrcHigh = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
+                uint16_t Divisor = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[2]);
                 uint32_t Source = (static_cast<uint32_t>(SrcHigh) << 16) | SrcLow;
                 uint32_t Res = Source % Divisor;
 
@@ -3563,9 +3559,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               }
 
               case 4: {
-                uint32_t SrcLow = *GetSrc<uint32_t*>(Op->Header.Args[0]);
-                uint32_t SrcHigh = *GetSrc<uint32_t*>(Op->Header.Args[1]);
-                uint32_t Divisor = *GetSrc<uint32_t*>(Op->Header.Args[2]);
+                uint32_t SrcLow = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
+                uint32_t SrcHigh = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
+                uint32_t Divisor = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[2]);
                 uint64_t Source = (static_cast<uint64_t>(SrcHigh) << 32) | SrcLow;
                 uint64_t Res = Source % Divisor;
 
@@ -3574,9 +3570,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 8: {
-                uint64_t SrcLow = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t SrcHigh = *GetSrc<uint64_t*>(Op->Header.Args[1]);
-                uint64_t Divisor = *GetSrc<uint64_t*>(Op->Header.Args[2]);
+                uint64_t SrcLow = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t SrcHigh = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
+                uint64_t Divisor = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[2]);
                 __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
                 __uint128_t Res = Source % Divisor;
                 // We only store the lower bits of the result
@@ -3593,9 +3589,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             // So you can have up to a 128bit Remainder from x86-64
             switch (OpSize) {
               case 2: {
-                uint16_t SrcLow = *GetSrc<uint16_t*>(Op->Header.Args[0]);
-                uint16_t SrcHigh = *GetSrc<uint16_t*>(Op->Header.Args[1]);
-                int16_t Divisor = *GetSrc<uint16_t*>(Op->Header.Args[2]);
+                uint16_t SrcLow = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[0]);
+                uint16_t SrcHigh = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[1]);
+                int16_t Divisor = *GetSrc<uint16_t*>(SSAData, Op->Header.Args[2]);
                 int32_t Source = (static_cast<uint32_t>(SrcHigh) << 16) | SrcLow;
                 int32_t Res = Source % Divisor;
 
@@ -3604,9 +3600,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 4: {
-                uint32_t SrcLow = *GetSrc<uint32_t*>(Op->Header.Args[0]);
-                uint32_t SrcHigh = *GetSrc<uint32_t*>(Op->Header.Args[1]);
-                int32_t Divisor = *GetSrc<uint32_t*>(Op->Header.Args[2]);
+                uint32_t SrcLow = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
+                uint32_t SrcHigh = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[1]);
+                int32_t Divisor = *GetSrc<uint32_t*>(SSAData, Op->Header.Args[2]);
                 int64_t Source = (static_cast<uint64_t>(SrcHigh) << 32) | SrcLow;
                 int64_t Res = Source % Divisor;
 
@@ -3615,9 +3611,9 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
                 break;
               }
               case 8: {
-                uint64_t SrcLow = *GetSrc<uint64_t*>(Op->Header.Args[0]);
-                uint64_t SrcHigh = *GetSrc<uint64_t*>(Op->Header.Args[1]);
-                int64_t Divisor = *GetSrc<int64_t*>(Op->Header.Args[2]);
+                uint64_t SrcLow = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
+                uint64_t SrcHigh = *GetSrc<uint64_t*>(SSAData, Op->Header.Args[1]);
+                int64_t Divisor = *GetSrc<int64_t*>(SSAData, Op->Header.Args[2]);
                 __int128_t Source = (static_cast<__int128_t>(SrcHigh) << 64) | SrcLow;
                 __int128_t Res = Source % Divisor;
                 // We only store the lower bits of the result
@@ -3630,8 +3626,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VEXTR: {
             auto Op = IROp->C<IR::IROp_VExtr>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             uint64_t Offset = Op->Index * Op->Header.ElementSize * 8;
             __uint128_t Dst = (Src1 << (sizeof(__uint128_t) * 8 - Offset)) | (Src2 >> Offset);
@@ -3641,8 +3637,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VINSGPR: {
             auto Op = IROp->C<IR::IROp_VInsGPR>();
-            __uint128_t Src1 = *GetSrc<__uint128_t*>(Op->Header.Args[0]);
-            __uint128_t Src2 = *GetSrc<__uint128_t*>(Op->Header.Args[1]);
+            __uint128_t Src1 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[0]);
+            __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             uint64_t Offset = Op->Index * Op->Header.ElementSize * 8;
             __uint128_t Mask = (1ULL << (Op->Header.ElementSize * 8)) - 1;
@@ -3657,11 +3653,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_FLOAT_FROMGPR_S: {
             auto Op = IROp->C<IR::IROp_Float_FromGPR_S>();
             if (Op->Header.ElementSize == 8) {
-              double Dst = (double)*GetSrc<int64_t*>(Op->Header.Args[0]);
+              double Dst = (double)*GetSrc<int64_t*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             else {
-              float Dst = (float)*GetSrc<int32_t*>(Op->Header.Args[0]);
+              float Dst = (float)*GetSrc<int32_t*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             break;
@@ -3669,11 +3665,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_FLOAT_FROMGPR_U: {
             auto Op = IROp->C<IR::IROp_Float_FromGPR_U>();
             if (Op->Header.ElementSize == 8) {
-              double Dst = (double)*GetSrc<uint64_t*>(Op->Header.Args[0]);
+              double Dst = (double)*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             else {
-              float Dst = (float)*GetSrc<uint32_t*>(Op->Header.Args[0]);
+              float Dst = (float)*GetSrc<uint32_t*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             break;
@@ -3681,11 +3677,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_FLOAT_TOGPR_ZS: {
             auto Op = IROp->C<IR::IROp_Float_ToGPR_ZS>();
             if (Op->Header.ElementSize == 8) {
-              int64_t Dst = (int64_t)*GetSrc<double*>(Op->Header.Args[0]);
+              int64_t Dst = (int64_t)*GetSrc<double*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             else {
-              int32_t Dst = (int32_t)*GetSrc<float*>(Op->Header.Args[0]);
+              int32_t Dst = (int32_t)*GetSrc<float*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             break;
@@ -3693,11 +3689,11 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_FLOAT_TOGPR_ZU: {
             auto Op = IROp->C<IR::IROp_Float_ToGPR_ZU>();
             if (Op->Header.ElementSize == 8) {
-              uint64_t Dst = (uint64_t)*GetSrc<double*>(Op->Header.Args[0]);
+              uint64_t Dst = (uint64_t)*GetSrc<double*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             else {
-              uint32_t Dst = (uint32_t)*GetSrc<float*>(Op->Header.Args[0]);
+              uint32_t Dst = (uint32_t)*GetSrc<float*>(SSAData, Op->Header.Args[0]);
               memcpy(GDP, &Dst, Op->Header.ElementSize);
             }
             break;
@@ -3707,12 +3703,12 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             uint16_t Conv = (Op->Header.ElementSize << 8) | Op->SrcElementSize;
             switch (Conv) {
               case 0x0804: { // Double <- Float
-                double Dst = (double)*GetSrc<float*>(Op->Header.Args[0]);
+                double Dst = (double)*GetSrc<float*>(SSAData, Op->Header.Args[0]);
                 memcpy(GDP, &Dst, 8);
                 break;
               }
               case 0x0408: { // Float <- Double
-                float Dst = (float)*GetSrc<double*>(Op->Header.Args[0]);
+                float Dst = (float)*GetSrc<double*>(SSAData, Op->Header.Args[0]);
                 memcpy(GDP, &Dst, 4);
                 break;
               }
@@ -3722,7 +3718,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VECTOR_FTOF: {
             auto Op = IROp->C<IR::IROp_Vector_FToF>();
-            void *Src = GetSrc<void*>(Op->Header.Args[0]);
+            void *Src = GetSrc<void*>(SSAData, Op->Header.Args[0]);
             uint8_t Tmp[16]{};
 
             uint16_t Conv = (Op->Header.ElementSize << 8) | Op->SrcElementSize;
@@ -3754,8 +3750,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             auto Op = IROp->C<IR::IROp_FCmp>();
             uint32_t ResultFlags{};
             if (Op->ElementSize == 4) {
-              float Src1 = *GetSrc<float*>(Op->Header.Args[0]);
-              float Src2 = *GetSrc<float*>(Op->Header.Args[1]);
+              float Src1 = *GetSrc<float*>(SSAData, Op->Header.Args[0]);
+              float Src2 = *GetSrc<float*>(SSAData, Op->Header.Args[1]);
               if (Op->Flags & (1 << FCMP_FLAG_LT)) {
                 if (Src1 < Src2) {
                   ResultFlags |= (1 << FCMP_FLAG_LT);
@@ -3773,8 +3769,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
               }
             }
             else {
-              double Src1 = *GetSrc<double*>(Op->Header.Args[0]);
-              double Src2 = *GetSrc<double*>(Op->Header.Args[1]);
+              double Src1 = *GetSrc<double*>(SSAData, Op->Header.Args[0]);
+              double Src2 = *GetSrc<double*>(SSAData, Op->Header.Args[1]);
               if (Op->Flags & (1 << FCMP_FLAG_LT)) {
                 if (Src1 < Src2) {
                   ResultFlags |= (1 << FCMP_FLAG_LT);
@@ -3797,7 +3793,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_GETHOSTFLAG: {
             auto Op = IROp->C<IR::IROp_GetHostFlag>();
-            GD = (*GetSrc<uint64_t*>(Op->Header.Args[0]) >> Op->Flag) & 1;
+            GD = (*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]) >> Op->Flag) & 1;
             break;
           }
           #define DO_SCALAR_COMPARE_OP(size, type, type2, func)              \
@@ -3822,8 +3818,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
           case IR::OP_VFCMPEQ: {
             auto Op = IROp->C<IR::IROp_VFCMPEQ>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return a == b ? ~0ULL : 0; };
 
@@ -3850,8 +3846,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFCMPNEQ: {
             auto Op = IROp->C<IR::IROp_VFCMPNEQ>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return a != b ? ~0ULL : 0; };
 
@@ -3878,8 +3874,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFCMPLT: {
             auto Op = IROp->C<IR::IROp_VFCMPLT>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return a < b ? ~0ULL : 0; };
 
@@ -3906,8 +3902,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFCMPLE: {
             auto Op = IROp->C<IR::IROp_VFCMPLE>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return a <= b ? ~0ULL : 0; };
 
@@ -3934,8 +3930,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFCMPUNO: {
             auto Op = IROp->C<IR::IROp_VFCMPUNO>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return (std::isnan(a) || std::isnan(b)) ? ~0ULL : 0; };
 
@@ -3962,8 +3958,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_VFCMPORD: {
             auto Op = IROp->C<IR::IROp_VFCMPORD>();
-            void *Src1 = GetSrc<void*>(Op->Header.Args[0]);
-            void *Src2 = GetSrc<void*>(Op->Header.Args[1]);
+            void *Src1 = GetSrc<void*>(SSAData, Op->Header.Args[0]);
+            void *Src2 = GetSrc<void*>(SSAData, Op->Header.Args[1]);
 
             auto Func = [](auto a, auto b) { return (!std::isnan(a) && !std::isnan(b)) ? ~0ULL : 0; };
 
@@ -3990,8 +3986,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80ADD: {
             auto Op = IROp->C<IR::IROp_F80Add>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FADD(Src1, Src2);
 
@@ -4000,8 +3996,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80SUB: {
             auto Op = IROp->C<IR::IROp_F80Sub>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FSUB(Src1, Src2);
 
@@ -4010,8 +4006,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80MUL: {
             auto Op = IROp->C<IR::IROp_F80Mul>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FMUL(Src1, Src2);
 
@@ -4020,8 +4016,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80DIV: {
             auto Op = IROp->C<IR::IROp_F80Div>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FDIV(Src1, Src2);
 
@@ -4030,8 +4026,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80FYL2X: {
             auto Op = IROp->C<IR::IROp_F80FYL2X>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FYL2X(Src1, Src2);
 
@@ -4040,8 +4036,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80ATAN: {
             auto Op = IROp->C<IR::IROp_F80ATAN>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FATAN(Src1, Src2);
 
@@ -4050,8 +4046,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80FPREM1: {
             auto Op = IROp->C<IR::IROp_F80FPREM1>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FREM1(Src1, Src2);
 
@@ -4060,8 +4056,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80FPREM: {
             auto Op = IROp->C<IR::IROp_F80FPREM>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FREM(Src1, Src2);
 
@@ -4070,8 +4066,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80SCALE: {
             auto Op = IROp->C<IR::IROp_F80SCALE>();
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FSCALE(Src1, Src2);
 
@@ -4080,7 +4076,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80CVT: {
             auto Op = IROp->C<IR::IROp_F80CVT>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
 
             switch (OpSize) {
               case 4: {
@@ -4099,7 +4095,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80CVTINT: {
             auto Op = IROp->C<IR::IROp_F80CVTInt>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
 
             switch (OpSize) {
               case 2: {
@@ -4126,13 +4122,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
             switch (Op->Size) {
               case 4: {
-                float Src = *GetSrc<float *>(Op->Header.Args[0]);
+                float Src = *GetSrc<float *>(SSAData, Op->Header.Args[0]);
                 X80SoftFloat Tmp = Src;
                 memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
                 break;
               }
               case 8: {
-                double Src = *GetSrc<double *>(Op->Header.Args[0]);
+                double Src = *GetSrc<double *>(SSAData, Op->Header.Args[0]);
                 X80SoftFloat Tmp = Src;
                 memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
                 break;
@@ -4146,13 +4142,13 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
 
             switch (Op->Size) {
               case 2: {
-                int16_t Src = *GetSrc<int16_t*>(Op->Header.Args[0]);
+                int16_t Src = *GetSrc<int16_t*>(SSAData, Op->Header.Args[0]);
                 X80SoftFloat Tmp = Src;
                 memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
                 break;
               }
               case 4: {
-                int32_t Src = *GetSrc<int32_t*>(Op->Header.Args[0]);
+                int32_t Src = *GetSrc<int32_t*>(SSAData, Op->Header.Args[0]);
                 X80SoftFloat Tmp = Src;
                 memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
                 break;
@@ -4163,7 +4159,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80ROUND: {
             auto Op = IROp->C<IR::IROp_F80Round>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FRNDINT(Src);
 
@@ -4172,7 +4168,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80F2XM1: {
             auto Op = IROp->C<IR::IROp_F80F2XM1>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::F2XM1(Src);
 
@@ -4181,7 +4177,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80TAN: {
             auto Op = IROp->C<IR::IROp_F80TAN>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FTAN(Src);
 
@@ -4190,7 +4186,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80SQRT: {
             auto Op = IROp->C<IR::IROp_F80SQRT>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FSQRT(Src);
 
@@ -4199,7 +4195,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80SIN: {
             auto Op = IROp->C<IR::IROp_F80SIN>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FSIN(Src);
             memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
@@ -4207,7 +4203,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80COS: {
             auto Op = IROp->C<IR::IROp_F80COS>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FCOS(Src);
             memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
@@ -4215,7 +4211,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80XTRACT_EXP: {
             auto Op = IROp->C<IR::IROp_F80XTRACT_EXP>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FXTRACT_EXP(Src);
             memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
@@ -4223,7 +4219,7 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           }
           case IR::OP_F80XTRACT_SIG: {
             auto Op = IROp->C<IR::IROp_F80XTRACT_SIG>();
-            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
+            X80SoftFloat Src = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
             X80SoftFloat Tmp;
             Tmp = X80SoftFloat::FXTRACT_SIG(Src);
             memcpy(GDP, &Tmp, sizeof(X80SoftFloat));
@@ -4232,8 +4228,8 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
           case IR::OP_F80CMP: {
             auto Op = IROp->C<IR::IROp_F80Cmp>();
             uint32_t ResultFlags{};
-            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(Op->Header.Args[0]);
-            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(Op->Header.Args[1]);
+            X80SoftFloat Src1 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[0]);
+            X80SoftFloat Src2 = *GetSrc<X80SoftFloat*>(SSAData, Op->Header.Args[1]);
             bool eq, lt, nan;
             X80SoftFloat::FCMP(Src1, Src2, &eq, &lt, &nan);
             if (Op->Flags & (1 << FCMP_FLAG_LT) &&
@@ -4265,16 +4261,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
       }
     };
 
-    HandleBlock();
+    HandleBlock(BlockNode);
 
     if (BlockResults.Redo) {
       continue;
     }
 
-    if (BlockIROp->Next.ID() == 0 || BlockResults.Quit) {
+    if (BlockResults.Quit || ++BlockIterator == BlockEnd) {
       break;
-    } else {
-      BlockNode = BlockIROp->Next.GetNode(ListBegin);
     }
   }
 

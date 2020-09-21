@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(guest-thunks)
 
+set(CMAKE_CXX_STANDARD 17)
+
 # These get passed in from the main cmake project
 set (X86_C_COMPILER "x86_64-linux-gnu-gcc" CACHE STRING "c compiler for compiling x86 guest libs")
 set (X86_CXX_COMPILER "x86_64-linux-gnu-g++" CACHE STRING "c++ compiler for compiling x86 guest libs")
@@ -45,6 +47,7 @@ add_guest_lib(GL)
 # generate(libSDL2 thunks)
 # add_guest_lib(SDL2)
 # target_include_directories(SDL2-guest PRIVATE ${SDL2_INCLUDE_DIRS})
+# target_link_libraries(SDL2-guest PRIVATE GL)
 
 generate(libX11 thunks)
 add_guest_lib(X11)

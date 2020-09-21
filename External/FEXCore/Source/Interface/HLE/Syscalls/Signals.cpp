@@ -6,6 +6,8 @@
 #include <FEXCore/Core/X86Enums.h>
 
 #include <signal.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace FEXCore::HLE {
 
@@ -24,6 +26,15 @@ namespace FEXCore::HLE {
 
     REGISTER_SYSCALL_IMPL(rt_sigpending, [](FEXCore::Core::InternalThreadState *Thread, uint64_t *set, size_t sigsetsize) -> uint64_t {
       return Thread->CTX->SignalDelegation.GuestSigPending(set, sigsetsize);
+    });
+
+    REGISTER_SYSCALL_IMPL(rt_sigsuspend, [](FEXCore::Core::InternalThreadState *Thread, uint64_t *unewset, size_t sigsetsize) -> uint64_t {
+      return Thread->CTX->SignalDelegation.GuestSigSuspend(unewset, sigsetsize);
+    });
+
+    REGISTER_SYSCALL_IMPL(userfaultfd, [](FEXCore::Core::InternalThreadState *Thread, int flags) -> uint64_t {
+      uint64_t Result = ::syscall(SYS_userfaultfd, flags);
+      SYSCALL_ERRNO();
     });
   }
 }
