@@ -168,6 +168,44 @@ void OpDispatchBuilder::RETOp(OpcodeArgs) {
   BlockSetRIP = true;
 }
 
+/*
+stack contains:
+RIP
+CS
+EFLAGS
+RSP
+SS
+*/
+void OpDispatchBuilder::IRETOp(OpcodeArgs) {
+  LogMan::Throw::A(CTX->Config.Is64BitMode == true, "IRET only implemented for x64");
+  
+  uint8_t GPRSize = CTX->Config.Is64BitMode ? 8 : 4;
+  
+  auto Constant = _Constant(GPRSize);
+
+  OrderedNode* SP = _LoadContext(GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), GPRClass);
+
+  // RIP (64 bits)
+  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, rip), _LoadMem(GPRClass, GPRSize, SP, GPRSize));
+  SP = _Add(SP, Constant);
+  //CS (lower 16 used)
+  _StoreContext(GPRClass, 2, offsetof(FEXCore::Core::CPUState, cs), _LoadMem(GPRClass, GPRSize, SP, GPRSize));
+  SP = _Add(SP, Constant);
+  //eflags (lower 16 used)
+  auto eflags = _LoadMem(GPRClass, GPRSize, SP, GPRSize);
+  SetPackedRFLAG(false, eflags);
+  SP = _Add(SP, Constant);
+  // RSP
+  _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), _LoadMem(GPRClass, GPRSize, SP, GPRSize));
+  SP = _Add(SP, Constant);
+  //ss
+  _StoreContext(GPRClass, 2, offsetof(FEXCore::Core::CPUState, ss), _LoadMem(GPRClass, GPRSize, SP, GPRSize));
+  SP = _Add(SP, Constant);
+  
+  _ExitFunction();
+  BlockSetRIP = true;
+}
+
 void OpDispatchBuilder::SIGRETOp(OpcodeArgs) {
   // Store the new RIP
   _SignalReturn();
@@ -2228,16 +2266,35 @@ void OpDispatchBuilder::RCLSmallerOp(OpcodeArgs) {
 template<uint32_t SrcIndex>
 void OpDispatchBuilder::BTOp(OpcodeArgs) {
   OrderedNode *Result;
-  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  OrderedNode *Src{};
+  bool AlreadyMasked{};
+
+  uint32_t Size = GetDstSize(Op) * 8;
+  uint32_t Mask = Size - 1;
+
+  if (Op->Src[SrcIndex].TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
+    Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  }
+  else {
+    // Can only be an immediate
+    // Masked by operand size
+    Src = _Constant(Size, Op->Src[SrcIndex].TypeLiteral.Literal & Mask);
+    AlreadyMasked = true;
+  }
+
   if (Op->Dest.TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
 
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
+    OrderedNode *BitSelect{};
+    if (AlreadyMasked) {
+      BitSelect = Src;
+    }
+    else {
+      OrderedNode *SizeMask = _Constant(Mask);
 
-    // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+      // Get the bit selection from the src
+      BitSelect = _And(Src, SizeMask);
+    }
 
     Result = _Lshr(Dest, BitSelect);
   }
@@ -2250,7 +2307,6 @@ void OpDispatchBuilder::BTOp(OpcodeArgs) {
 
     // Address is provided as bits we want BYTE offsets
     // Extract Signed offset
-    uint32_t Size = GetSrcSize(Op) * 8;
     Src = _Sbfe(Size-3,3, Src);
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
@@ -2269,16 +2325,35 @@ void OpDispatchBuilder::BTOp(OpcodeArgs) {
 template<uint32_t SrcIndex>
 void OpDispatchBuilder::BTROp(OpcodeArgs) {
   OrderedNode *Result;
-  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  OrderedNode *Src{};
+  bool AlreadyMasked{};
+
+  uint32_t Size = GetDstSize(Op) * 8;
+  uint32_t Mask = Size - 1;
+
+  if (Op->Src[SrcIndex].TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
+    Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  }
+  else {
+    // Can only be an immediate
+    // Masked by operand size
+    Src = _Constant(Size, Op->Src[SrcIndex].TypeLiteral.Literal & Mask);
+    AlreadyMasked = true;
+  }
+
   if (Op->Dest.TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
 
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
+    OrderedNode *BitSelect{};
+    if (AlreadyMasked) {
+      BitSelect = Src;
+    }
+    else {
+      OrderedNode *SizeMask = _Constant(Mask);
 
-    // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+      // Get the bit selection from the src
+      BitSelect = _And(Src, SizeMask);
+    }
 
     Result = _Lshr(Dest, BitSelect);
 
@@ -2296,7 +2371,6 @@ void OpDispatchBuilder::BTROp(OpcodeArgs) {
 
     // Address is provided as bits we want BYTE offsets
     // Extract Signed offset
-    uint32_t Size = GetSrcSize(Op) * 8;
     Src = _Sbfe(Size-3,3, Src);
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
@@ -2319,16 +2393,35 @@ void OpDispatchBuilder::BTROp(OpcodeArgs) {
 template<uint32_t SrcIndex>
 void OpDispatchBuilder::BTSOp(OpcodeArgs) {
   OrderedNode *Result;
-  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  OrderedNode *Src{};
+  bool AlreadyMasked{};
+
+  uint32_t Size = GetDstSize(Op) * 8;
+  uint32_t Mask = Size - 1;
+
+  if (Op->Src[SrcIndex].TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
+    Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  }
+  else {
+    // Can only be an immediate
+    // Masked by operand size
+    Src = _Constant(Size, Op->Src[SrcIndex].TypeLiteral.Literal & Mask);
+    AlreadyMasked = true;
+  }
+
   if (Op->Dest.TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
 
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
+    OrderedNode *BitSelect{};
+    if (AlreadyMasked) {
+      BitSelect = Src;
+    }
+    else {
+      OrderedNode *SizeMask = _Constant(Mask);
 
-    // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+      // Get the bit selection from the src
+      BitSelect = _And(Src, SizeMask);
+    }
 
     Result = _Lshr(Dest, BitSelect);
 
@@ -2345,7 +2438,6 @@ void OpDispatchBuilder::BTSOp(OpcodeArgs) {
 
     // Address is provided as bits we want BYTE offsets
     // Extract Signed offset
-    uint32_t Size = GetSrcSize(Op) * 8;
     Src = _Sbfe(Size-3,3, Src);
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
@@ -2367,16 +2459,35 @@ void OpDispatchBuilder::BTSOp(OpcodeArgs) {
 template<uint32_t SrcIndex>
 void OpDispatchBuilder::BTCOp(OpcodeArgs) {
   OrderedNode *Result;
-  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  OrderedNode *Src{};
+  bool AlreadyMasked{};
+
+  uint32_t Size = GetDstSize(Op) * 8;
+  uint32_t Mask = Size - 1;
+
+  if (Op->Src[SrcIndex].TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
+    Src = LoadSource(GPRClass, Op, Op->Src[SrcIndex], Op->Flags, -1);
+  }
+  else {
+    // Can only be an immediate
+    // Masked by operand size
+    Src = _Constant(Size, Op->Src[SrcIndex].TypeLiteral.Literal & Mask);
+    AlreadyMasked = true;
+  }
+
   if (Op->Dest.TypeNone.Type == FEXCore::X86Tables::DecodedOperand::TYPE_GPR) {
     OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
 
-    uint32_t Size = GetSrcSize(Op);
-    uint32_t Mask = Size * 8 - 1;
-    OrderedNode *SizeMask = _Constant(Mask);
+    OrderedNode *BitSelect{};
+    if (AlreadyMasked) {
+      BitSelect = Src;
+    }
+    else {
+      OrderedNode *SizeMask = _Constant(Mask);
 
-    // Get the bit selection from the src
-    OrderedNode *BitSelect = _And(Src, SizeMask);
+      // Get the bit selection from the src
+      BitSelect = _And(Src, SizeMask);
+    }
 
     Result = _Lshr(Dest, BitSelect);
 
@@ -2392,7 +2503,6 @@ void OpDispatchBuilder::BTCOp(OpcodeArgs) {
 
     // Address is provided as bits we want BYTE offsets
     // Extract Signed offset
-    uint32_t Size = GetSrcSize(Op) * 8;
     Src = _Sbfe(Size-3,3, Src);
 
     // Get the address offset by shifting out the size of the op (To shift out the bit selection)
@@ -2956,11 +3066,11 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
     auto Src1 = _LoadMemTSO(GPRClass, Size, Dest_RDI, Size);
     auto Src2 = _LoadMemTSO(GPRClass, Size, Dest_RSI, Size);
 
-    OrderedNode* Result = _Sub(Src1, Src2);
+    OrderedNode* Result = _Sub(Src2, Src1);
     if (Size < 4)
       Result = _Bfe(Size * 8, 0, Result);
 
-    GenerateFlags_SUB(Op, Result, Src1, Src2);
+    GenerateFlags_SUB(Op, Result, Src2, Src1);
 
     auto DF = GetRFLAG(FEXCore::X86State::RFLAG_DF_LOC);
     auto PtrDir = _Select(FEXCore::IR::COND_EQ,
@@ -3006,11 +3116,11 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
         auto Src1 = _LoadMemTSO(GPRClass, Size, Dest_RDI, Size);
         auto Src2 = _LoadMem(GPRClass, Size, Dest_RSI, Size);
 
-        OrderedNode* Result = _Sub(Src1, Src2);
+        OrderedNode* Result = _Sub(Src2, Src1);
         if (Size < 4)
           Result = _Bfe(Size * 8, 0, Result);
 
-        GenerateFlags_SUB(Op, Result, Src1, Src2);
+        GenerateFlags_SUB(Op, Result, Src2, Src1);
 
         OrderedNode *TailCounter = _LoadContext(GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RCX]), GPRClass);
 
@@ -3321,12 +3431,18 @@ void OpDispatchBuilder::POPFOp(OpcodeArgs) {
 
   auto OldSP = _LoadContext(GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), GPRClass);
 
-  auto Src = _LoadMem(GPRClass, Size, OldSP, Size);
+  OrderedNode *Src = _LoadMem(GPRClass, Size, OldSP, Size);
 
   auto NewSP = _Add(OldSP, Constant);
 
   // Store the new stack pointer
   _StoreContext(GPRClass, GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RSP]), NewSP);
+
+  // Add back our flag constants
+  // Bit 1 is always 1
+  // Bit 9 is always 1 because we always have interrupts enabled
+
+  Src = _Or(Src, _Constant(Size * 8, 0x202));
 
   SetPackedRFLAG(false, Src);
 }
@@ -3899,6 +4015,35 @@ void OpDispatchBuilder::PMULOp(OpcodeArgs) {
     Res = _VSMul(Size, ElementSize, Dest, Src);
   else
     Res = _VUMul(Size, ElementSize, Dest, Src);
+  StoreResult(FPRClass, Op, Res, -1);
+}
+
+template<size_t ElementSize>
+void OpDispatchBuilder::PSIGN(OpcodeArgs) {
+  auto Size = GetSrcSize(Op);
+
+  OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+  OrderedNode *Dest = LoadSource(FPRClass, Op, Op->Dest, Op->Flags, -1);
+
+  auto ZeroVec = _VectorZero(Size);
+  auto NegVec = _VNeg(Size, ElementSize, Dest);
+
+  OrderedNode *CmpLT = _VCMPLTZ(Size, ElementSize, Src);
+  OrderedNode *CmpEQ = _VCMPEQZ(Size, ElementSize, Src);
+  OrderedNode *CmpGT = _VCMPGTZ(Size, ElementSize, Src);
+
+  // Negative elements return -dest
+  CmpLT = _VAnd(Size, ElementSize, CmpLT, NegVec);
+
+  // Zero elements return 0
+  CmpEQ = _VAnd(Size, ElementSize, CmpEQ, ZeroVec);
+
+  // Positive elements return dest
+  CmpGT = _VAnd(Size, ElementSize, CmpGT, Dest);
+
+  // Or our results
+  OrderedNode *Res = _VOr(Size, ElementSize, CmpGT, _VOr(Size, ElementSize, CmpLT, CmpEQ));
+
   StoreResult(FPRClass, Op, Res, -1);
 }
 
@@ -5651,7 +5796,9 @@ template<size_t DstElementSize, bool Signed>
 void OpDispatchBuilder::CVTGPR_To_FPR(OpcodeArgs) {
   OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[0], Op->Flags, -1);
 
-  if (Op->Flags & X86Tables::DecodeFlags::FLAG_REX_WIDENING) {
+  size_t GPRSize = GetSrcSize(Op);
+
+  if (GPRSize == 8) {
     // Source is 64bit
     if (DstElementSize == 4) {
       Src = _Bfe(32, 0, Src);
@@ -5676,16 +5823,37 @@ void OpDispatchBuilder::CVTGPR_To_FPR(OpcodeArgs) {
   StoreResult(FPRClass, Op, Src, -1);
 }
 
-template<size_t SrcElementSize, bool Signed>
+template<size_t SrcElementSize, bool Signed, bool HostRoundingMode>
 void OpDispatchBuilder::CVTFPR_To_GPR(OpcodeArgs) {
   OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
 
-  if (Signed)
-    Src = _Float_ToGPR_ZS(Src, SrcElementSize);
-  else
-    Src = _Float_ToGPR_ZU(Src, SrcElementSize);
+  // GPR size is determined by REX.W
+  // Source Element size is determined by instruction
+  size_t GPRSize = GetDstSize(Op);
 
-  StoreResult_WithOpSize(GPRClass, Op, Op->Dest, Src, SrcElementSize, -1);
+  if (HostRoundingMode) {
+    if (Signed)
+      Src = _Float_ToGPR_S(Src, SrcElementSize);
+    else
+      Src = _Float_ToGPR_U(Src, SrcElementSize);
+  }
+  else {
+    if (Signed)
+      Src = _Float_ToGPR_ZS(Src, SrcElementSize);
+    else
+      Src = _Float_ToGPR_ZU(Src, SrcElementSize);
+  }
+
+  if (GPRSize > SrcElementSize) {
+    if (Signed) {
+      Src = _Sext(SrcElementSize * 8, Src);
+    }
+    else {
+      Src = _Bfe(SrcElementSize * 8, 0, Src);
+    }
+  }
+
+  StoreResult_WithOpSize(GPRClass, Op, Op->Dest, Src, GPRSize, -1);
 }
 
 template<size_t SrcElementSize, bool Signed, bool Widen>
@@ -5707,7 +5875,7 @@ void OpDispatchBuilder::Vector_CVT_Int_To_Float(OpcodeArgs) {
   StoreResult(FPRClass, Op, Src, -1);
 }
 
-template<size_t SrcElementSize, bool Signed, bool Narrow>
+template<size_t SrcElementSize, bool Signed, bool Narrow, bool HostRoundingMode>
 void OpDispatchBuilder::Vector_CVT_Float_To_Int(OpcodeArgs) {
   OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
 
@@ -5719,10 +5887,18 @@ void OpDispatchBuilder::Vector_CVT_Float_To_Int(OpcodeArgs) {
     ElementSize >>= 1;
   }
 
-  if (Signed)
-    Src = _Vector_FToZS(Src, Size, ElementSize);
-  else
-    Src = _Vector_FToZU(Src, Size, ElementSize);
+  if (HostRoundingMode) {
+    if (Signed)
+      Src = _Vector_FToS(Src, Size, ElementSize);
+    else
+      Src = _Vector_FToU(Src, Size, ElementSize);
+  }
+  else {
+    if (Signed)
+      Src = _Vector_FToZS(Src, Size, ElementSize);
+    else
+      Src = _Vector_FToZU(Src, Size, ElementSize);
+  }
 
   StoreResult_WithOpSize(FPRClass, Op, Op->Dest, Src, Size, -1);
 }
@@ -5758,22 +5934,94 @@ void OpDispatchBuilder::MMX_To_XMM_Vector_CVT_Int_To_Float(OpcodeArgs) {
   OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
 
   size_t ElementSize = SrcElementSize;
-  size_t Size = GetSrcSize(Op);
+  size_t DstSize = GetDstSize(Op);
   if (Widen) {
-    Src = _VSXTL(Src, Size, ElementSize);
+    Src = _VSXTL(Src, DstSize, ElementSize);
     ElementSize <<= 1;
   }
 
   if (Signed)
-    Src = _Vector_SToF(Src, Size, ElementSize);
+    Src = _Vector_SToF(Src, DstSize, ElementSize);
   else
-    Src = _Vector_UToF(Src, Size, ElementSize);
+    Src = _Vector_UToF(Src, DstSize, ElementSize);
 
-  OrderedNode *Dest = LoadSource_WithOpSize(FPRClass, Op, Op->Dest, GetDstSize(Op), Op->Flags, -1);
-  // Insert the lower bits
-  Dest = _VInsElement(GetDstSize(Op), 8, 0, 0, Dest, Src);
+  OrderedNode *Dest{};
+
+  if (Widen) {
+    Dest = Src;
+  }
+  else {
+    Dest = LoadSource_WithOpSize(FPRClass, Op, Op->Dest, DstSize, Op->Flags, -1);
+    // Insert the lower bits
+    Dest = _VInsElement(GetDstSize(Op), 8, 0, 0, Dest, Src);
+  }
 
   StoreResult(FPRClass, Op, Dest, -1);
+}
+
+template<size_t SrcElementSize, bool Signed, bool Narrow, bool HostRoundingMode>
+void OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int(OpcodeArgs) {
+  OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+
+  size_t ElementSize = SrcElementSize;
+  size_t Size = GetDstSize(Op);
+
+  if (Narrow) {
+    Src = _Vector_FToF(Size, SrcElementSize >> 1, SrcElementSize, Src);
+    ElementSize >>= 1;
+  }
+
+  if (HostRoundingMode) {
+    if (Signed)
+      Src = _Vector_FToS(Src, Size, ElementSize);
+    else
+      Src = _Vector_FToU(Src, Size, ElementSize);
+  }
+  else {
+    if (Signed)
+      Src = _Vector_FToZS(Src, Size, ElementSize);
+    else
+      Src = _Vector_FToZU(Src, Size, ElementSize);
+  }
+
+  StoreResult_WithOpSize(FPRClass, Op, Op->Dest, Src, Size, -1);
+}
+
+void OpDispatchBuilder::MASKMOVOp(OpcodeArgs) {
+  // Until we get correct PHI nodes this is required to be a loop unroll
+  uint8_t GPRSize = CTX->Config.Is64BitMode ? 8 : 4;
+  auto Size = GetSrcSize(Op) * 8;
+
+  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[0], Op->Flags, -1);
+  OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
+
+  OrderedNode *MemDest = _LoadContext(GPRSize, offsetof(FEXCore::Core::CPUState, gregs[FEXCore::X86State::REG_RDI]), GPRClass);
+
+  auto NumElements = Size / 64;
+  for (size_t Element = 0; Element < NumElements; ++Element) {
+    // Extract the current element
+    auto SrcElement = _VExtractToGPR(GetSrcSize(Op), 8, Src, Element);
+    auto DestElement = _VExtractToGPR(GetSrcSize(Op), 8, Dest, Element);
+
+    size_t NumSelectBits = 64 / 8;
+    for (size_t Select = 0; Select < NumSelectBits; ++Select) {
+      auto SelectMask = _Bfe(1, 8 * Select + 7, SrcElement);
+      auto CondJump = _CondJump(SelectMask);
+      auto StoreBlock = CreateNewCodeBlock();
+      SetTrueJumpTarget(CondJump, StoreBlock);
+      SetCurrentCodeBlock(StoreBlock);
+      {
+        auto DestByte = _Bfe(8, 8 * Select, DestElement);
+        auto MemLocation = _Add(MemDest, _Constant(Element * 8 + Select));
+        _StoreMemTSO(GPRClass, 1, MemLocation, DestByte, 1);
+      }
+      auto Jump = _Jump();
+      auto NextJumpTarget = CreateNewCodeBlock();
+      SetJumpTarget(Jump, NextJumpTarget);
+      SetFalseJumpTarget(CondJump, NextJumpTarget);
+      SetCurrentCodeBlock(NextJumpTarget);
+    }
+  }
 }
 
 void OpDispatchBuilder::MOVBetweenGPR_FPR(OpcodeArgs) {
@@ -5787,9 +6035,7 @@ void OpDispatchBuilder::MOVBetweenGPR_FPR(OpcodeArgs) {
   else {
     // Destination is GPR or mem
     // Extract from XMM first
-    uint8_t ElementSize = 4;
-    if (Op->Flags & X86Tables::DecodeFlags::FLAG_REX_WIDENING)
-      ElementSize = 8;
+    auto ElementSize = GetDstSize(Op);
     OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0],Op->Flags, -1);
 
     Src = _VExtractToGPR(GetSrcSize(Op), ElementSize, Src, 0);
@@ -5812,6 +6058,22 @@ void OpDispatchBuilder::TZCNT(OpcodeArgs) {
   // Set flags
   SetRFLAG<FEXCore::X86State::RFLAG_CF_LOC>(ZFResult);
   SetRFLAG<FEXCore::X86State::RFLAG_ZF_LOC>(_Bfe(1, 0, Src));
+}
+
+void OpDispatchBuilder::LZCNT(OpcodeArgs) {
+  OrderedNode *Src = LoadSource(GPRClass, Op, Op->Src[0], Op->Flags, -1);
+
+  auto Res = _CountLeadingZeroes(Src);
+  StoreResult(GPRClass, Op, Res, -1);
+
+  auto Zero = _Constant(0);
+  auto ZFResult = _Select(FEXCore::IR::COND_EQ,
+      Src,  Zero,
+      _Constant(1), Zero);
+
+  // Set flags
+  SetRFLAG<FEXCore::X86State::RFLAG_CF_LOC>(ZFResult);
+  SetRFLAG<FEXCore::X86State::RFLAG_ZF_LOC>(_Bfe(1, GetSrcSize(Op) * 8 - 1, Src));
 }
 
 template<size_t ElementSize, bool Scalar>
@@ -5911,6 +6173,35 @@ void OpDispatchBuilder::FLD(OpcodeArgs) {
   // Write to ST[TOP]
   _StoreContextIndexed(converted, top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
   //_StoreContext(converted, 16, offsetof(FEXCore::Core::CPUState, mm[7][0]));
+}
+
+void OpDispatchBuilder::FBLD(OpcodeArgs) {
+  Current_Header->ShouldInterpret = true;
+
+  // Update TOP
+  auto orig_top = GetX87Top();
+  auto mask = _Constant(7);
+  auto top = _And(_Sub(orig_top, _Constant(1)), mask);
+  SetX87Top(top);
+
+  // Read from memory
+  OrderedNode *data = LoadSource_WithOpSize(FPRClass, Op, Op->Src[0], 16, Op->Flags, -1);
+  OrderedNode *converted = _F80BCDLoad(data);
+  _StoreContextIndexed(converted, top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
+}
+
+void OpDispatchBuilder::FBSTP(OpcodeArgs) {
+  Current_Header->ShouldInterpret = true;
+
+  auto orig_top = GetX87Top();
+  auto data = _LoadContextIndexed(orig_top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
+
+  OrderedNode *converted = _F80BCDStore(data);
+
+	StoreResult_WithOpSize(FPRClass, Op, Op->Dest, converted, 10, 1);
+
+	auto top = _And(_Add(orig_top, _Constant(1)), _Constant(7));
+	SetX87Top(top);
 }
 
 template<uint64_t Lower, uint32_t Upper>
@@ -6471,7 +6762,7 @@ void OpDispatchBuilder::X87FYL2X(OpcodeArgs) {
   auto top = _And(_Add(orig_top, _Constant(1)), _Constant(7));
   SetX87Top(top);
 
-  auto a = _LoadContextIndexed(orig_top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
+  OrderedNode *st0 = _LoadContextIndexed(orig_top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
   OrderedNode *st1 = _LoadContextIndexed(top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
 
   if (Plus1) {
@@ -6479,10 +6770,10 @@ void OpDispatchBuilder::X87FYL2X(OpcodeArgs) {
     auto high = _Constant(0b0'011'1111'1111'1111);
     OrderedNode *data = _VCastFromGPR(16, 8, low);
     data = _VInsGPR(16, 8, data, high, 1);
-    st1 = _F80Add(st1, data);
+    st0 = _F80Add(st0, data);
   }
 
-  auto result = _F80FYL2X(st1, a);
+  auto result = _F80FYL2X(st0, st1);
 
   // Write to ST[TOP]
   _StoreContextIndexed(result, top, 16, offsetof(FEXCore::Core::CPUState, mm[0][0]), 16, FPRClass);
@@ -6863,11 +7154,11 @@ void OpDispatchBuilder::X87FCMOV(OpcodeArgs) {
   switch (Opcode) {
   case 0x3'C0:
     FLAGMask = 1 << FEXCore::X86State::RFLAG_CF_LOC;
-    Type = COMPARE_NOTZERO;
+    Type = COMPARE_ZERO;
   break;
   case 0x2'C0:
     FLAGMask = 1 << FEXCore::X86State::RFLAG_CF_LOC;
-    Type = COMPARE_ZERO;
+    Type = COMPARE_NOTZERO;
   break;
   case 0x2'C8:
     FLAGMask = 1 << FEXCore::X86State::RFLAG_ZF_LOC;
@@ -6910,8 +7201,8 @@ void OpDispatchBuilder::X87FCMOV(OpcodeArgs) {
       break;
     }
     case COMPARE_NOTZERO: {
-      SrcCond = _Select(FEXCore::IR::COND_NEQ,
-      AndOp, ZeroConst, OneConst, ZeroConst);
+      SrcCond = _Select(FEXCore::IR::COND_EQ,
+      AndOp, ZeroConst, ZeroConst, OneConst);
       break;
     }
   }
@@ -7106,11 +7397,19 @@ void OpDispatchBuilder::UCOMISxOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::LDMXCSR(OpcodeArgs) {
+  OrderedNode *Dest = LoadSource(GPRClass, Op, Op->Dest, Op->Flags, -1);
+  // We only support the rounding mode being set
+  OrderedNode *RoundingMode = _Bfe(4, 3, 13, Dest);
+  _SetRoundingMode(RoundingMode);
 }
 
 void OpDispatchBuilder::STMXCSR(OpcodeArgs) {
   // Default MXCSR
-  StoreResult(GPRClass, Op, _Constant(0x1F80), -1);
+  OrderedNode *MXCSR = _Constant(32, 0x1F80);
+  OrderedNode *RoundingMode = _GetRoundingMode();
+  MXCSR = _Bfi(3, 13, MXCSR, RoundingMode);
+
+  StoreResult(GPRClass, Op, MXCSR, -1);
 }
 
 template<size_t ElementSize>
@@ -7226,6 +7525,28 @@ void OpDispatchBuilder::PSUBSOp(OpcodeArgs) {
   StoreResult(FPRClass, Op, Res, -1);
 }
 
+template<size_t ElementSize>
+void OpDispatchBuilder::ADDSUBPOp(OpcodeArgs) {
+  auto Size = GetSrcSize(Op);
+
+  OrderedNode *Dest = LoadSource(FPRClass, Op, Op->Dest, Op->Flags, -1);
+  OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+
+  OrderedNode *ResAdd{};
+  OrderedNode *ResSub{};
+  ResAdd = _VFAdd(Size, ElementSize, Dest, Src);
+  ResSub = _VFSub(Size, ElementSize, Dest, Src);
+
+  // We now need to swizzle results
+  uint8_t NumElements = Size / ElementSize;
+  // Even elements are the sub result
+  // Odd elements are the add results
+  for (size_t i = 0; i < NumElements; i += 2) {
+    ResAdd = _VInsElement(Size, ElementSize, i, i, ResAdd, ResSub);
+  }
+  StoreResult(FPRClass, Op, ResAdd, -1);
+}
+
 void OpDispatchBuilder::PMADDWD(OpcodeArgs) {
   // This is a pretty curious operation
   // Does two MADD operations across 4 16bit signed integers and accumulates to 32bit integers in the destination
@@ -7332,15 +7653,15 @@ void OpDispatchBuilder::HSUBP(OpcodeArgs) {
   OrderedNode *Swizzle_Src = Src;
 
   if (ElementSize == 4) {
-    Swizzle_Dest = _VInsElement(Size, ElementSize, 0, 0, Swizzle_Dest, Dest_Neg);
-    Swizzle_Dest = _VInsElement(Size, ElementSize, 2, 2, Swizzle_Dest, Dest_Neg);
+    Swizzle_Dest = _VInsElement(Size, ElementSize, 1, 1, Swizzle_Dest, Dest_Neg);
+    Swizzle_Dest = _VInsElement(Size, ElementSize, 3, 3, Swizzle_Dest, Dest_Neg);
 
-    Swizzle_Src = _VInsElement(Size, ElementSize, 0, 0, Swizzle_Src, Src_Neg);
-    Swizzle_Src = _VInsElement(Size, ElementSize, 2, 2, Swizzle_Src, Src_Neg);
+    Swizzle_Src = _VInsElement(Size, ElementSize, 1, 1, Swizzle_Src, Src_Neg);
+    Swizzle_Src = _VInsElement(Size, ElementSize, 3, 3, Swizzle_Src, Src_Neg);
   }
   else {
-    Swizzle_Dest = _VInsElement(Size, ElementSize, 0, 0, Swizzle_Dest, Dest_Neg);
-    Swizzle_Src = _VInsElement(Size, ElementSize, 0, 0, Swizzle_Src, Src_Neg);
+    Swizzle_Dest = _VInsElement(Size, ElementSize, 1, 1, Swizzle_Dest, Dest_Neg);
+    Swizzle_Src = _VInsElement(Size, ElementSize, 1, 1, Swizzle_Src, Src_Neg);
   }
 
   OrderedNode *Res = _VFAddP(Size, ElementSize, Swizzle_Dest, Swizzle_Src);
@@ -7477,6 +7798,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xC8, 1, &OpDispatchBuilder::EnterOp},
     {0xC9, 1, &OpDispatchBuilder::LEAVEOp},
     {0xCC, 2, &OpDispatchBuilder::INTOp},
+    {0xCF, 1, &OpDispatchBuilder::IRETOp},
     {0xD7, 2, &OpDispatchBuilder::XLATOp},
     {0xE0, 3, &OpDispatchBuilder::LoopOp},
     {0xE3, 1, &OpDispatchBuilder::CondJUMPRCXOp},
@@ -7544,7 +7866,8 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x28, 2, &OpDispatchBuilder::MOVUPSOp},
     {0x2A, 1, &OpDispatchBuilder::MMX_To_XMM_Vector_CVT_Int_To_Float<4, true, false>},
     {0x2B, 1, &OpDispatchBuilder::MOVAPSOp},
-    {0x2C, 2, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false>},
+    {0x2C, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false, true>},
+    {0x2D, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false, false>},
     {0x2E, 2, &OpDispatchBuilder::UCOMISxOp<4>},
     {0x50, 1, &OpDispatchBuilder::MOVMSKOp<4>},
     {0x51, 1, &OpDispatchBuilder::VectorUnaryOp<IR::OP_VFSQRT, 4, false>},
@@ -7589,6 +7912,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xD3, 1, &OpDispatchBuilder::PSRLDOp<8, true, 0>},
     {0xD4, 1, &OpDispatchBuilder::PADDQOp<8>},
     {0xD5, 1, &OpDispatchBuilder::PMULOp<2, true>},
+    {0xD7, 1, &OpDispatchBuilder::MOVMSKOp<1>}, // PMOVMSKB
     {0xD8, 1, &OpDispatchBuilder::PSUBSOp<1, false>},
     {0xD9, 1, &OpDispatchBuilder::PSUBSOp<2, false>},
     {0xDA, 1, &OpDispatchBuilder::PMINUOp<1>},
@@ -7619,6 +7943,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xF4, 1, &OpDispatchBuilder::PMULLOp<4, false>},
     {0xF5, 1, &OpDispatchBuilder::PMADDWD},
     {0xF6, 1, &OpDispatchBuilder::PSADBW},
+    {0xF7, 1, &OpDispatchBuilder::MASKMOVOp},
     {0xF8, 1, &OpDispatchBuilder::PSUBQOp<1>},
     {0xF9, 1, &OpDispatchBuilder::PSUBQOp<2>},
     {0xFA, 1, &OpDispatchBuilder::PSUBQOp<4>},
@@ -7677,6 +8002,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC0), 3), 1, &OpDispatchBuilder::RCROp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC0), 4), 1, &OpDispatchBuilder::SHLImmediateOp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC0), 5), 1, &OpDispatchBuilder::SHRImmediateOp},
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC0), 6), 1, &OpDispatchBuilder::SHLImmediateOp}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC0), 7), 1, &OpDispatchBuilder::ASHRImmediateOp}, // SAR
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 0), 1, &OpDispatchBuilder::ROLImmediateOp},
@@ -7685,6 +8011,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 3), 1, &OpDispatchBuilder::RCROp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 4), 1, &OpDispatchBuilder::SHLImmediateOp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 5), 1, &OpDispatchBuilder::SHRImmediateOp},
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 6), 1, &OpDispatchBuilder::SHLImmediateOp}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xC1), 7), 1, &OpDispatchBuilder::ASHRImmediateOp}, // SAR
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 0), 1, &OpDispatchBuilder::ROLOp<true>},
@@ -7693,6 +8020,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 3), 1, &OpDispatchBuilder::RCROp8x1Bit},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 4), 1, &OpDispatchBuilder::SHLOp<true>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 5), 1, &OpDispatchBuilder::SHROp<true>}, // 1Bit SHR
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 6), 1, &OpDispatchBuilder::SHLOp<true>}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD0), 7), 1, &OpDispatchBuilder::ASHROp<true>}, // SAR
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 0), 1, &OpDispatchBuilder::ROLOp<true>},
@@ -7701,6 +8029,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 3), 1, &OpDispatchBuilder::RCROp1Bit},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 4), 1, &OpDispatchBuilder::SHLOp<true>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 5), 1, &OpDispatchBuilder::SHROp<true>}, // 1Bit SHR
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 6), 1, &OpDispatchBuilder::SHLOp<true>}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD1), 7), 1, &OpDispatchBuilder::ASHROp<true>}, // SAR
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 0), 1, &OpDispatchBuilder::ROLOp<false>},
@@ -7709,6 +8038,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 3), 1, &OpDispatchBuilder::RCRSmallerOp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 4), 1, &OpDispatchBuilder::SHLOp<false>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 5), 1, &OpDispatchBuilder::SHROp<false>}, // SHR by CL
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 6), 1, &OpDispatchBuilder::SHLOp<false>}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD2), 7), 1, &OpDispatchBuilder::ASHROp<false>}, // SAR
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 0), 1, &OpDispatchBuilder::ROLOp<false>},
@@ -7717,10 +8047,12 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 3), 1, &OpDispatchBuilder::RCROp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 4), 1, &OpDispatchBuilder::SHLOp<false>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 5), 1, &OpDispatchBuilder::SHROp<false>}, // SHR by CL
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 6), 1, &OpDispatchBuilder::SHLOp<false>}, // SAL
     {OPD(FEXCore::X86Tables::TYPE_GROUP_2, OpToIndex(0xD3), 7), 1, &OpDispatchBuilder::ASHROp<false>}, // SAR
 
     // GROUP 3
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 0), 1, &OpDispatchBuilder::TESTOp<1>},
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 1), 1, &OpDispatchBuilder::TESTOp<1>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 2), 1, &OpDispatchBuilder::NOTOp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 3), 1, &OpDispatchBuilder::NEGOp}, // NEG
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 4), 1, &OpDispatchBuilder::MULOp},
@@ -7729,6 +8061,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF6), 7), 1, &OpDispatchBuilder::IDIVOp}, // IDIV
 
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF7), 0), 1, &OpDispatchBuilder::TESTOp<1>},
+    {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF7), 1), 1, &OpDispatchBuilder::TESTOp<1>},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF7), 2), 1, &OpDispatchBuilder::NOTOp},
     {OPD(FEXCore::X86Tables::TYPE_GROUP_3, OpToIndex(0xF7), 3), 1, &OpDispatchBuilder::NEGOp}, // NEG
 
@@ -7761,15 +8094,15 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x19, 7, &OpDispatchBuilder::NOPOp},
     {0x2A, 1, &OpDispatchBuilder::CVTGPR_To_FPR<4, true>},
     {0x2B, 1, &OpDispatchBuilder::MOVVectorOp},
-    {0x2C, 1, &OpDispatchBuilder::CVTFPR_To_GPR<4, true>},
-    {0x2D, 1, &OpDispatchBuilder::CVTFPR_To_GPR<4, true>},
+    {0x2C, 1, &OpDispatchBuilder::CVTFPR_To_GPR<4, true, false>},
+    {0x2D, 1, &OpDispatchBuilder::CVTFPR_To_GPR<4, true, true>},
     {0x51, 1, &OpDispatchBuilder::VectorUnaryOp<IR::OP_VFSQRT, 4, true>},
     {0x52, 1, &OpDispatchBuilder::VectorUnaryOp<IR::OP_VFRSQRT, 4, true>},
     {0x53, 1, &OpDispatchBuilder::VectorUnaryOp<IR::OP_VFRECP, 4, true>},
     {0x58, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFADD, 4>},
     {0x59, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFMUL, 4>},
     {0x5A, 1, &OpDispatchBuilder::Scalar_CVT_Float_To_Float<8, 4>},
-    {0x5B, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false>},
+    {0x5B, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false, false>},
     {0x5C, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFSUB, 4>},
     {0x5D, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFMIN, 4>},
     {0x5E, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFDIV, 4>},
@@ -7779,7 +8112,8 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x7E, 1, &OpDispatchBuilder::MOVQOp},
     {0x7F, 1, &OpDispatchBuilder::MOVUPSOp},
     {0xB8, 1, &OpDispatchBuilder::PopcountOp},
-    {0xBC, 2, &OpDispatchBuilder::TZCNT},
+    {0xBC, 1, &OpDispatchBuilder::TZCNT},
+    {0xBD, 1, &OpDispatchBuilder::LZCNT},
     {0xC2, 1, &OpDispatchBuilder::VFCMPOp<4, true>},
     {0xD6, 1, &OpDispatchBuilder::MOVQ2DQ<true>},
     {0xE6, 1, &OpDispatchBuilder::Vector_CVT_Int_To_Float<4, true, true>},
@@ -7791,8 +8125,8 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x19, 7, &OpDispatchBuilder::NOPOp},
     {0x2A, 1, &OpDispatchBuilder::CVTGPR_To_FPR<8, true>},
     {0x2B, 1, &OpDispatchBuilder::MOVVectorOp},
-    {0x2C, 1, &OpDispatchBuilder::CVTFPR_To_GPR<8, true>},
-    {0x2D, 1, &OpDispatchBuilder::CVTFPR_To_GPR<8, true>},
+    {0x2C, 1, &OpDispatchBuilder::CVTFPR_To_GPR<8, true, false>},
+    {0x2D, 1, &OpDispatchBuilder::CVTFPR_To_GPR<8, true, true>},
     {0x51, 1, &OpDispatchBuilder::VectorUnaryOp<IR::OP_VFSQRT, 8, true>},
     //x52 = Invalid
     {0x58, 1, &OpDispatchBuilder::VectorScalarALUOp<IR::OP_VFADD, 8>},
@@ -7805,9 +8139,10 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x70, 1, &OpDispatchBuilder::PSHUFDOp<2, true, true>},
     {0x7C, 1, &OpDispatchBuilder::HADDP<4>},
     {0x7D, 1, &OpDispatchBuilder::HSUBP<4>},
+    {0xD0, 1, &OpDispatchBuilder::ADDSUBPOp<4>},
     {0xD6, 1, &OpDispatchBuilder::MOVQ2DQ<false>},
     {0xC2, 1, &OpDispatchBuilder::VFCMPOp<8, true>},
-    {0xE6, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<8, true, true>},
+    {0xE6, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<8, true, true, true>},
     {0xF0, 1, &OpDispatchBuilder::MOVVectorOp},
   };
 
@@ -7819,6 +8154,9 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x16, 2, &OpDispatchBuilder::MOVHPDOp},
     {0x19, 7, &OpDispatchBuilder::NOPOp},
     {0x28, 2, &OpDispatchBuilder::MOVAPSOp},
+    {0x2A, 1, &OpDispatchBuilder::MMX_To_XMM_Vector_CVT_Int_To_Float<4, true, true>},
+    {0x2C, 1, &OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int<8, true, true, true>},
+    {0x2D, 1, &OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int<8, true, true, false>},
     {0x2E, 2, &OpDispatchBuilder::UCOMISxOp<8>},
 
     {0x40, 16, &OpDispatchBuilder::CMOVOp},
@@ -7831,7 +8169,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0x58, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VFADD, 8>},
     {0x59, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VFMUL, 8>},
     {0x5A, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Float<4, 8>},
-    {0x5B, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false>},
+    {0x5B, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<4, true, false, true>},
     {0x5C, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VFSUB, 8>},
     {0x5D, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VFMIN, 8>},
     {0x5E, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VFDIV, 8>},
@@ -7867,6 +8205,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xC5, 1, &OpDispatchBuilder::PExtrOp<2>},
     {0xC6, 1, &OpDispatchBuilder::SHUFOp<8>},
 
+    {0xD0, 1, &OpDispatchBuilder::ADDSUBPOp<8>},
     {0xD1, 1, &OpDispatchBuilder::PSRLDOp<2, true, 0>},
     {0xD2, 1, &OpDispatchBuilder::PSRLDOp<4, true, 0>},
     {0xD3, 1, &OpDispatchBuilder::PSRLDOp<8, true, 0>},
@@ -7888,7 +8227,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xE3, 1, &OpDispatchBuilder::PAVGOp<2>},
     {0xE4, 1, &OpDispatchBuilder::PMULHW<false>},
     {0xE5, 1, &OpDispatchBuilder::PMULHW<true>},
-    {0xE6, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<8, true, true>},
+    {0xE6, 1, &OpDispatchBuilder::Vector_CVT_Float_To_Int<8, true, true, false>},
     {0xE7, 1, &OpDispatchBuilder::MOVVectorOp},
     {0xE8, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VSQSUB, 1>},
     {0xE9, 1, &OpDispatchBuilder::VectorALUOp<IR::OP_VSQSUB, 2>},
@@ -7905,6 +8244,7 @@ void InstallOpcodeHandlers(Context::OperatingMode Mode) {
     {0xF4, 1, &OpDispatchBuilder::PMULLOp<4, false>},
     {0xF5, 1, &OpDispatchBuilder::PMADDWD},
     {0xF6, 1, &OpDispatchBuilder::PSADBW},
+    {0xF7, 1, &OpDispatchBuilder::MASKMOVOp},
     {0xF8, 1, &OpDispatchBuilder::PSUBQOp<1>},
     {0xF9, 1, &OpDispatchBuilder::PSUBQOp<2>},
     {0xFA, 1, &OpDispatchBuilder::PSUBQOp<4>},
@@ -8216,11 +8556,11 @@ constexpr uint16_t PF_F2 = 3;
 
     {OPDReg(0xDF, 3) | 0x00, 8, &OpDispatchBuilder::FIST},
 
-    // 4 = FBLD
+    {OPDReg(0xDF, 4) | 0x00, 8, &OpDispatchBuilder::FBLD},
 
     {OPDReg(0xDF, 5) | 0x00, 8, &OpDispatchBuilder::FILD},
 
-    // 6 = FTSTB
+    {OPDReg(0xDF, 6) | 0x00, 8, &OpDispatchBuilder::FBSTP},
 
     {OPDReg(0xDF, 7) | 0x00, 8, &OpDispatchBuilder::FIST},
 
@@ -8240,6 +8580,13 @@ constexpr uint16_t PF_F2 = 3;
   constexpr uint16_t PF_38_66   = 1;
   constexpr uint16_t PF_38_F2   = 2;
   const std::vector<std::tuple<uint16_t, uint8_t, FEXCore::X86Tables::OpDispatchPtr>> H0F38Table = {
+    {OPD(PF_38_NONE, 0x08), 1, &OpDispatchBuilder::PSIGN<1>},
+    {OPD(PF_38_66,   0x08), 1, &OpDispatchBuilder::PSIGN<1>},
+    {OPD(PF_38_NONE, 0x09), 1, &OpDispatchBuilder::PSIGN<2>},
+    {OPD(PF_38_66,   0x09), 1, &OpDispatchBuilder::PSIGN<2>},
+    {OPD(PF_38_NONE, 0x0A), 1, &OpDispatchBuilder::PSIGN<4>},
+    {OPD(PF_38_66,   0x0A), 1, &OpDispatchBuilder::PSIGN<4>},
+
     {OPD(PF_38_66,   0x00), 1, &OpDispatchBuilder::UnimplementedOp},
     {OPD(PF_38_66,   0x3B), 1, &OpDispatchBuilder::UnimplementedOp},
 

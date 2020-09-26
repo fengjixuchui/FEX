@@ -2,18 +2,22 @@
 #include <SDL2/SDL_syswm.h>
 
 #include <GL/glx.h>
+#include <dlfcn.h>
 
 #include <stdio.h>
 #include <cstring>
 #include <map>
 #include <string>
-
-#include "Thunk.h"
 #include <stdarg.h>
+
+#include "common/Guest.h"
+
+#include "thunks.inl"
+#include "function_packs.inl"
+#include "function_packs_public.inl"
 
 LOAD_LIB(libSDL2)
 
-#include "libSDL2_thunks.inl"
 #include <vector>
 
 struct __va_list_tag;
@@ -39,5 +43,24 @@ extern "C" {
     void* SDL_GL_GetProcAddress(const char* name) {
 		// TODO: Fix this HACK
 		return (void*)glXGetProcAddress((const GLubyte*)name);
+    }
+
+    // TODO: These are not 100% conforming to SDL either
+    void *SDL_LoadObject(const char *sofile) {
+        auto lib = dlopen(sofile, RTLD_NOW | RTLD_LOCAL);
+        if (!lib) {
+            printf("SDL_LoadObject: Failed to load %s\n", sofile);
+        }
+        return lib;
+    }
+
+    void *SDL_LoadFunction(void *lib, const char *name) {
+        return dlsym(lib, name);
+    }
+
+    void SDL_UnloadObject(void *lib) {
+        if (lib) {
+            dlclose(lib);
+        }
     }
 }

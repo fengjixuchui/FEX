@@ -890,6 +890,25 @@ DEF_OP(FindTrailingZeros) {
   }
 }
 
+DEF_OP(CountLeadingZeroes) {
+  auto Op = IROp->C<IR::IROp_CountLeadingZeroes>();
+  uint8_t OpSize = IROp->Size;
+  switch (OpSize) {
+    case 2:
+      lsl(GetReg<RA_32>(Node), GetReg<RA_32>(Op->Header.Args[0].ID()), 16);
+      orr(GetReg<RA_32>(Node), GetReg<RA_32>(Node), 0x8000);
+      clz(GetReg<RA_32>(Node), GetReg<RA_32>(Node));
+    break;
+    case 4:
+      clz(GetReg<RA_32>(Node), GetReg<RA_32>(Op->Header.Args[0].ID()));
+      break;
+    case 8:
+      clz(GetReg<RA_64>(Node), GetReg<RA_64>(Op->Header.Args[0].ID()));
+      break;
+    default: LogMan::Msg::A("Unknown size: %d", OpSize); break;
+  }
+}
+
 DEF_OP(Rev) {
   auto Op = IROp->C<IR::IROp_Rev>();
   uint8_t OpSize = IROp->Size;
@@ -1032,6 +1051,22 @@ DEF_OP(Float_ToGPR_ZS) {
   }
 }
 
+DEF_OP(Float_ToGPR_U) {
+  LogMan::Msg::D("Unimplemented");
+}
+
+DEF_OP(Float_ToGPR_S) {
+  auto Op = IROp->C<IR::IROp_Float_ToGPR_S>();
+  if (Op->Header.ElementSize == 8) {
+    frinti(VTMP1.D(), GetSrc(Op->Header.Args[0].ID()).D());
+    fcvtzs(GetReg<RA_64>(Node), VTMP1.D());
+  }
+  else {
+    frinti(VTMP1.S(), GetSrc(Op->Header.Args[0].ID()).S());
+    fcvtzs(GetReg<RA_32>(Node), VTMP1.S());
+  }
+}
+
 DEF_OP(FCmp) {
   auto Op = IROp->C<IR::IROp_FCmp>();
 
@@ -1102,6 +1137,7 @@ void JITCore::RegisterALUHandlers() {
   REGISTER_OP(FINDLSB,           FindLSB);
   REGISTER_OP(FINDMSB,           FindMSB);
   REGISTER_OP(FINDTRAILINGZEROS, FindTrailingZeros);
+  REGISTER_OP(COUNTLEADINGZEROES, CountLeadingZeroes);
   REGISTER_OP(REV,               Rev);
   REGISTER_OP(BFI,               Bfi);
   REGISTER_OP(BFE,               Bfe);
@@ -1110,6 +1146,8 @@ void JITCore::RegisterALUHandlers() {
   REGISTER_OP(VEXTRACTTOGPR,     VExtractToGPR);
   REGISTER_OP(FLOAT_TOGPR_ZU,    Float_ToGPR_ZU);
   REGISTER_OP(FLOAT_TOGPR_ZS,    Float_ToGPR_ZS);
+  REGISTER_OP(FLOAT_TOGPR_U,     Float_ToGPR_U);
+  REGISTER_OP(FLOAT_TOGPR_S,     Float_ToGPR_S);
   REGISTER_OP(FCMP,              FCmp);
   REGISTER_OP(F80CMP,            F80Cmp);
 

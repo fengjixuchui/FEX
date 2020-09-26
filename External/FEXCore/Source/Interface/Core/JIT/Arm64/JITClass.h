@@ -272,6 +272,7 @@ private:
   DEF_OP(FindLSB);
   DEF_OP(FindMSB);
   DEF_OP(FindTrailingZeros);
+  DEF_OP(CountLeadingZeroes);
   DEF_OP(Rev);
   DEF_OP(Bfi);
   DEF_OP(Bfe);
@@ -280,6 +281,8 @@ private:
   DEF_OP(VExtractToGPR);
   DEF_OP(Float_ToGPR_ZU);
   DEF_OP(Float_ToGPR_ZS);
+  DEF_OP(Float_ToGPR_U);
+  DEF_OP(Float_ToGPR_S);
   DEF_OP(FCmp);
   DEF_OP(F80Cmp);
 
@@ -323,6 +326,8 @@ private:
   DEF_OP(Vector_SToF);
   DEF_OP(Vector_FToZU);
   DEF_OP(Vector_FToZS);
+  DEF_OP(Vector_FToU);
+  DEF_OP(Vector_FToS);
   DEF_OP(Vector_FToF);
 
   ///< Flag ops
@@ -353,6 +358,8 @@ private:
   DEF_OP(Phi);
   DEF_OP(PhiValue);
   DEF_OP(Print);
+  DEF_OP(GetRoundingMode);
+  DEF_OP(SetRoundingMode);
 
   ///< Move ops
   DEF_OP(ExtractElementPair);
@@ -360,6 +367,7 @@ private:
   DEF_OP(Mov);
 
   ///< Vector ops
+  DEF_OP(VectorZero);
   DEF_OP(CreateVector2);
   DEF_OP(CreateVector4);
   DEF_OP(SplatVector2);
@@ -399,7 +407,10 @@ private:
   DEF_OP(VZip2);
   DEF_OP(VBSL);
   DEF_OP(VCMPEQ);
+  DEF_OP(VCMPEQZ);
   DEF_OP(VCMPGT);
+  DEF_OP(VCMPGTZ);
+  DEF_OP(VCMPLTZ);
   DEF_OP(VFCMPEQ);
   DEF_OP(VFCMPNEQ);
   DEF_OP(VFCMPLT);

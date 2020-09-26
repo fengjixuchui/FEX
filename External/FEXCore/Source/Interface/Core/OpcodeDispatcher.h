@@ -106,6 +106,7 @@ public:
   void LEAOp(OpcodeArgs);
   void NOPOp(OpcodeArgs);
   void RETOp(OpcodeArgs);
+  void IRETOp(OpcodeArgs);
   void SIGRETOp(OpcodeArgs);
   void CallbackReturnOp(OpcodeArgs);
   void SecondaryALUOp(OpcodeArgs);
@@ -273,7 +274,7 @@ public:
   void MOVDDUPOp(OpcodeArgs);
   template<size_t DstElementSize, bool Signed>
   void CVTGPR_To_FPR(OpcodeArgs);
-  template<size_t SrcElementSize, bool Signed>
+  template<size_t SrcElementSize, bool Signed, bool HostRoundingMode>
   void CVTFPR_To_GPR(OpcodeArgs);
   template<size_t SrcElementSize, bool Signed, bool Widen>
   void Vector_CVT_Int_To_Float(OpcodeArgs);
@@ -281,12 +282,16 @@ public:
   void Scalar_CVT_Float_To_Float(OpcodeArgs);
   template<size_t DstElementSize, size_t SrcElementSize>
   void Vector_CVT_Float_To_Float(OpcodeArgs);
-  template<size_t SrcElementSize, bool Signed, bool Narrow>
+  template<size_t SrcElementSize, bool Signed, bool Narrow, bool HostRoundingMode>
   void Vector_CVT_Float_To_Int(OpcodeArgs);
   template<size_t SrcElementSize, bool Signed, bool Widen>
   void MMX_To_XMM_Vector_CVT_Int_To_Float(OpcodeArgs);
+  template<size_t SrcElementSize, bool Signed, bool Narrow, bool HostRoundingMode>
+  void XMM_To_MMX_Vector_CVT_Float_To_Int(OpcodeArgs);
+  void MASKMOVOp(OpcodeArgs);
   void MOVBetweenGPR_FPR(OpcodeArgs);
   void TZCNT(OpcodeArgs);
+  void LZCNT(OpcodeArgs);
   void MOVSSOp(OpcodeArgs);
   template<size_t ElementSize, bool Scalar>
   void VFCMPOp(OpcodeArgs);
@@ -300,11 +305,17 @@ public:
   template<size_t ElementSize, bool Signed>
   void PMULOp(OpcodeArgs);
 
+  template<size_t ElementSize>
+  void PSIGN(OpcodeArgs);
+
   // X87 Ops
   template<size_t width>
   void FLD(OpcodeArgs);
   template<uint64_t Lower, uint32_t Upper>
   void FLD_Const(OpcodeArgs);
+
+  void FBLD(OpcodeArgs);
+  void FBSTP(OpcodeArgs);
 
   void FILD(OpcodeArgs);
 
@@ -388,6 +399,9 @@ public:
 
   template<size_t ElementSize, bool Signed>
   void PSUBSOp(OpcodeArgs);
+
+  template<size_t ElementSize>
+  void ADDSUBPOp(OpcodeArgs);
 
   void PMADDWD(OpcodeArgs);
 

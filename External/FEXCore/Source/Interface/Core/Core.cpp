@@ -250,6 +250,7 @@ namespace FEXCore::Context {
     memset(NewThreadState.flags, 0, 32);
     NewThreadState.gs = 0;
     NewThreadState.flags[1] = 1;
+    NewThreadState.flags[9] = 1;
 
     FEXCore::Core::InternalThreadState *Thread = CreateThread(&NewThreadState, 0);
 
@@ -315,6 +316,10 @@ namespace FEXCore::Context {
   void Context::HandleCallback(uint64_t RIP) {
     auto Thread = Core::ThreadData.Thread;
     Thread->CPUBackend->CallbackPtr(Thread, RIP);
+  }
+
+  void Context::RegisterFrontendHostSignalHandler(int Signal, HostSignalDelegatorFunction Func) {
+    SignalDelegation.RegisterFrontendHostSignalHandler(Signal, Func);
   }
 
   void Context::WaitForIdle() {
@@ -790,6 +795,8 @@ namespace FEXCore::Context {
     Thread->State.ThreadManager.TID = ::gettid();
     Thread->State.ThreadManager.PID = ::getpid();
     SignalDelegation.RegisterTLSState(Thread);
+    ThunkHandler->RegisterTLSState(Thread);
+    
     ++IdleWaitRefCount;
 
     LogMan::Msg::D("[%d] Waiting to run", Thread->State.ThreadManager.TID.load());

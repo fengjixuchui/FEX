@@ -2272,8 +2272,7 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           if (NumPush & 1)
             sub(rsp, 8); // Align
 
-          mov(rdi, reinterpret_cast<uintptr_t>(CTX));
-          mov(rsi, GetSrc<RA_64>(Op->Header.Args[0].ID()));
+          mov(rdi, GetSrc<RA_64>(Op->Header.Args[0].ID()));
 
           mov(rax, reinterpret_cast<uintptr_t>(Op->ThunkFnPtr));
           call(rax);
@@ -2404,6 +2403,11 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           auto Dst = GetSrcPair<RA_64>(Node);
           mov(Dst.first, rax);
           mov(Dst.second, rdx);
+          break;
+        }
+        case IR::OP_VECTORZERO: {
+          auto Dst = GetDst(Node);
+          vpxor(Dst, Dst, Dst);
           break;
         }
         case IR::OP_SPLATVECTOR2:
@@ -3456,6 +3460,19 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VECTOR_FTOS: {
+          auto Op = IROp->C<IR::IROp_Vector_FToS>();
+          switch (Op->Header.ElementSize) {
+            case 4:
+              cvtps2dq(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            case 8:
+              cvtpd2dq(GetDst(Node), GetSrc(Op->Header.Args[0].ID()));
+            break;
+            default: LogMan::Msg::A("Unknown castGPR element size: %d", Op->Header.ElementSize);
+          }
+          break;
+        }
         case IR::OP_VECTOR_FTOF: {
           auto Op = IROp->C<IR::IROp_Vector_FToF>();
           uint16_t Conv = (Op->Header.ElementSize << 8) | Op->SrcElementSize;
@@ -3519,6 +3536,27 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VCMPEQZ: {
+          auto Op = IROp->C<IR::IROp_VCMPEQZ>();
+          vpxor(xmm15, xmm15, xmm15);
+
+          switch (Op->Header.ElementSize) {
+          case 1:
+            vpcmpeqb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 2:
+            vpcmpeqw(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 4:
+            vpcmpeqd(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 8:
+            vpcmpeqq(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          default: LogMan::Msg::A("Unsupported elementSize: %d", Op->Header.ElementSize);
+          }
+          break;
+        }
         case IR::OP_VCMPGT: {
           auto Op = IROp->C<IR::IROp_VCMPGT>();
 
@@ -3539,6 +3577,49 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VCMPGTZ: {
+          auto Op = IROp->C<IR::IROp_VCMPGTZ>();
+          vpxor(xmm15, xmm15, xmm15);
+
+          switch (Op->Header.ElementSize) {
+          case 1:
+            vpcmpgtb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 2:
+            vpcmpgtw(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 4:
+            vpcmpgtd(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          case 8:
+            vpcmpgtq(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), xmm15);
+          break;
+          default: LogMan::Msg::A("Unsupported elementSize: %d", Op->Header.ElementSize);
+          }
+          break;
+        }
+        case IR::OP_VCMPLTZ: {
+          auto Op = IROp->C<IR::IROp_VCMPLTZ>();
+          vpxor(xmm15, xmm15, xmm15);
+
+          switch (Op->Header.ElementSize) {
+          case 1:
+            vpcmpgtb(GetDst(Node), xmm15, GetSrc(Op->Header.Args[0].ID()));
+          break;
+          case 2:
+            vpcmpgtw(GetDst(Node), xmm15, GetSrc(Op->Header.Args[0].ID()));
+          break;
+          case 4:
+            vpcmpgtd(GetDst(Node), xmm15, GetSrc(Op->Header.Args[0].ID()));
+          break;
+          case 8:
+            vpcmpgtq(GetDst(Node), xmm15, GetSrc(Op->Header.Args[0].ID()));
+          break;
+          default: LogMan::Msg::A("Unsupported elementSize: %d", Op->Header.ElementSize);
+          }
+          break;
+        }
+
         case IR::OP_VFCMPEQ: {
           auto Op = IROp->C<IR::IROp_VFCMPEQ>();
 
@@ -4144,6 +4225,15 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           else
             cvttss2si(GetDst<RA_32>(Node), GetSrc(Op->Header.Args[0].ID()));
+          break;
+        }
+        case IR::OP_FLOAT_TOGPR_S: {
+          auto Op = IROp->C<IR::IROp_Float_ToGPR_S>();
+          if (Op->Header.ElementSize == 8) {
+            cvtsd2si(GetDst<RA_64>(Node), GetSrc(Op->Header.Args[0].ID()));
+          }
+          else
+            cvtss2si(GetDst<RA_32>(Node), GetSrc(Op->Header.Args[0].ID()));
           break;
         }
         case IR::OP_FLOAT_FTOF: {
@@ -4836,6 +4926,70 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_COUNTLEADINGZEROES: {
+          auto Op = IROp->C<IR::IROp_CountLeadingZeroes>();
+          if (Features.has(Xbyak::util::Cpu::tLZCNT)) {
+            switch (OpSize) {
+              case 2: {
+                lzcnt(GetDst<RA_16>(Node), GetSrc<RA_16>(Op->Header.Args[0].ID()));
+                movzx(GetDst<RA_32>(Node), GetDst<RA_16>(Node));
+                break;
+              }
+              case 4: {
+                lzcnt(GetDst<RA_32>(Node), GetSrc<RA_32>(Op->Header.Args[0].ID()));
+                break;
+              }
+              case 8: {
+                lzcnt(GetDst<RA_64>(Node), GetSrc<RA_64>(Op->Header.Args[0].ID()));
+                break;
+              }
+              default: LogMan::Msg::A("Unknown size: %d", OpSize); break;
+            }
+          }
+          else {
+            switch (OpSize) {
+              case 2: {
+                test(GetSrc<RA_16>(Op->Header.Args[0].ID()), 0x8000);
+                Label Skip;
+                mov(GetDst<RA_32>(Node), 0);
+                jne(Skip);
+                  bsr(GetDst<RA_16>(Node), GetSrc<RA_16>(Op->Header.Args[0].ID()));
+                  mov(eax, 0x0F);
+                  cmovz(GetDst<RA_32>(Node), eax);
+                  add(GetDst<RA_32>(Node), 1);
+                L(Skip);
+                break;
+              }
+              case 4: {
+                test(GetSrc<RA_32>(Op->Header.Args[0].ID()), 0x80000000);
+                Label Skip;
+                mov(GetDst<RA_32>(Node), 0);
+                jne(Skip);
+                  bsr(GetDst<RA_32>(Node), GetSrc<RA_32>(Op->Header.Args[0].ID()));
+                  mov(eax, 0x1F);
+                  cmovz(GetDst<RA_32>(Node), eax);
+                  add(GetDst<RA_32>(Node), 1);
+                L(Skip);
+                break;
+              }
+              case 8: {
+                mov(rax, 0x8000000000000000ULL);
+                test(GetSrc<RA_64>(Op->Header.Args[0].ID()), rax);
+                Label Skip;
+                mov(GetDst<RA_32>(Node), 0);
+                jne(Skip);
+                  bsr(GetDst<RA_64>(Node), GetSrc<RA_64>(Op->Header.Args[0].ID()));
+                  mov(rax, 0x3F);
+                  cmovz(GetDst<RA_64>(Node), rax);
+                  add(GetDst<RA_64>(Node), 1);
+                L(Skip);
+                break;
+              }
+              default: LogMan::Msg::A("Unknown size: %d", OpSize); break;
+            }
+          }
+          break;
+        }
         case IR::OP_FENCE: {
           auto Op = IROp->C<IR::IROp_Fence>();
           switch (Op->Fence) {
@@ -4909,6 +5063,39 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           for (uint32_t i = RA64.size(); i > 0; --i)
             pop(RA64[i - 1]);
 
+          break;
+        }
+        case IR::OP_GETROUNDINGMODE: {
+          auto Dst = GetDst<RA_32>(Node);
+          sub(rsp, 4);
+          // Only stores to memory
+          stmxcsr(dword [rsp]);
+          mov(Dst, dword [rsp]);
+          add(rsp, 4);
+          shr(Dst, 13);
+          break;
+        }
+        case IR::OP_SETROUNDINGMODE: {
+          auto Op = IROp->C<IR::IROp_SetRoundingMode>();
+          auto Src = GetSrc<RA_32>(Op->Header.Args[0].ID());
+
+          // Load old mxcsr
+          // Only stores to memory
+          sub(rsp, 4);
+          stmxcsr(dword [rsp]);
+          mov(TMP1.cvt32(), dword [rsp]);
+
+          // Insert the new rounding mode
+          and(TMP1.cvt32(), ~(0b111 << 13));
+          mov(TMP2.cvt32(), Src);
+          shl(TMP2.cvt32(), 13);
+          or(TMP1.cvt32(), TMP2.cvt32());
+
+          // Store it to mxcsr
+          // Only loads from memory
+          mov(dword [rsp], TMP1.cvt32());
+          ldmxcsr(dword [rsp]);
+          add(rsp, 4);
           break;
         }
         case IR::OP_DUMMY:
