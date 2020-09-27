@@ -248,6 +248,7 @@ public:
   void PUNPCKLOp(OpcodeArgs);
   template<size_t ElementSize>
   void PUNPCKHOp(OpcodeArgs);
+  void PSHUFBOp(OpcodeArgs);
   template<size_t ElementSize, bool HalfSize, bool Low>
   void PSHUFDOp(OpcodeArgs);
   template<size_t ElementSize>
@@ -307,6 +308,9 @@ public:
 
   template<size_t ElementSize>
   void PSIGN(OpcodeArgs);
+
+  template<size_t ElementSize>
+  void PABS(OpcodeArgs);
 
   // X87 Ops
   template<size_t width>

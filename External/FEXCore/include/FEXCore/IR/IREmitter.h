@@ -112,6 +112,9 @@ friend class FEXCore::IR::PassManager;
   IRPair<IROp_VOr> _VOr(uint8_t RegisterSize, uint8_t ElementSize, OrderedNode *ssa0, OrderedNode *ssa1) {
     return _VOr(ssa0, ssa1, RegisterSize, ElementSize);
   }
+  IRPair<IROp_VXor> _VXor(uint8_t RegisterSize, uint8_t ElementSize, OrderedNode *ssa0, OrderedNode *ssa1) {
+    return _VXor(ssa0, ssa1, RegisterSize, ElementSize);
+  }
   IRPair<IROp_VAdd> _VAdd(uint8_t RegisterSize, uint8_t ElementSize, OrderedNode *ssa0, OrderedNode *ssa1) {
     return _VAdd(ssa0, ssa1, RegisterSize, ElementSize);
   }
@@ -318,6 +321,9 @@ friend class FEXCore::IR::PassManager;
   }
   IRPair<IROp_VUXTL2> _VUXTL2(uint8_t RegisterSize, uint8_t ElementSize, OrderedNode *ssa0) {
     return _VUXTL2(ssa0, RegisterSize, ElementSize);
+  }
+  IRPair<IROp_VTBL1> _VTBL1(uint8_t RegisterSize, OrderedNode *ssa0, OrderedNode *ssa1) {
+    return _VTBL1(ssa0, ssa1, RegisterSize);
   }
   IRPair<IROp_Jump> _Jump() {
     return _Jump(InvalidNode);

@@ -3899,6 +3899,15 @@ void OpDispatchBuilder::PUNPCKHOp(OpcodeArgs) {
   StoreResult(FPRClass, Op, ALUOp, -1);
 }
 
+void OpDispatchBuilder::PSHUFBOp(OpcodeArgs) {
+  auto Size = GetSrcSize(Op);
+  OrderedNode *Dest = LoadSource(FPRClass, Op, Op->Dest, Op->Flags, -1);
+  OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+
+  auto Res = _VTBL1(Size, Dest, Src);
+  StoreResult(FPRClass, Op, Res, -1);
+}
+
 template<size_t ElementSize, bool HalfSize, bool Low>
 void OpDispatchBuilder::PSHUFDOp(OpcodeArgs) {
   LogMan::Throw::A(ElementSize != 0, "What. No element size?");
@@ -4043,7 +4052,15 @@ void OpDispatchBuilder::PSIGN(OpcodeArgs) {
 
   // Or our results
   OrderedNode *Res = _VOr(Size, ElementSize, CmpGT, _VOr(Size, ElementSize, CmpLT, CmpEQ));
+  StoreResult(FPRClass, Op, Res, -1);
+}
 
+template<size_t ElementSize>
+void OpDispatchBuilder::PABS(OpcodeArgs) {
+  auto Size = GetSrcSize(Op);
+
+  OrderedNode *Src = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+  auto Res = _VAbs(Size, ElementSize, Src);
   StoreResult(FPRClass, Op, Res, -1);
 }
 
@@ -7365,9 +7382,17 @@ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
 void OpDispatchBuilder::PAlignrOp(OpcodeArgs) {
   OrderedNode *Src1 = LoadSource(FPRClass, Op, Op->Dest, Op->Flags, -1);
   OrderedNode *Src2 = LoadSource(FPRClass, Op, Op->Src[0], Op->Flags, -1);
+  auto Size = GetDstSize(Op);
 
   uint8_t Index = Op->Src[1].TypeLiteral.Literal;
-  OrderedNode *Res = _VExtr(GetDstSize(Op), 1, Src1, Src2, Index);
+  OrderedNode *Res{};
+  if (Index >= (Size * 2)) {
+    // If the immediate is greater than both vectors combined then it zeroes the vector
+    Res = _VectorZero(Size);
+  }
+  else {
+    Res = _VExtr(Size, 1, Src1, Src2, Index);
+  }
   StoreResult(FPRClass, Op, Res, -1);
 }
 
@@ -8580,16 +8605,21 @@ constexpr uint16_t PF_F2 = 3;
   constexpr uint16_t PF_38_66   = 1;
   constexpr uint16_t PF_38_F2   = 2;
   const std::vector<std::tuple<uint16_t, uint8_t, FEXCore::X86Tables::OpDispatchPtr>> H0F38Table = {
+    {OPD(PF_38_NONE, 0x00), 1, &OpDispatchBuilder::PSHUFBOp},
+    {OPD(PF_38_66,   0x00), 1, &OpDispatchBuilder::PSHUFBOp},
     {OPD(PF_38_NONE, 0x08), 1, &OpDispatchBuilder::PSIGN<1>},
     {OPD(PF_38_66,   0x08), 1, &OpDispatchBuilder::PSIGN<1>},
     {OPD(PF_38_NONE, 0x09), 1, &OpDispatchBuilder::PSIGN<2>},
     {OPD(PF_38_66,   0x09), 1, &OpDispatchBuilder::PSIGN<2>},
     {OPD(PF_38_NONE, 0x0A), 1, &OpDispatchBuilder::PSIGN<4>},
     {OPD(PF_38_66,   0x0A), 1, &OpDispatchBuilder::PSIGN<4>},
-
-    {OPD(PF_38_66,   0x00), 1, &OpDispatchBuilder::UnimplementedOp},
+    {OPD(PF_38_NONE, 0x1C), 1, &OpDispatchBuilder::PABS<1>},
+    {OPD(PF_38_66,   0x1C), 1, &OpDispatchBuilder::PABS<1>},
+    {OPD(PF_38_NONE, 0x1D), 1, &OpDispatchBuilder::PABS<2>},
+    {OPD(PF_38_66,   0x1D), 1, &OpDispatchBuilder::PABS<2>},
+    {OPD(PF_38_NONE, 0x1E), 1, &OpDispatchBuilder::PABS<4>},
+    {OPD(PF_38_66,   0x1E), 1, &OpDispatchBuilder::PABS<4>},
     {OPD(PF_38_66,   0x3B), 1, &OpDispatchBuilder::UnimplementedOp},
-
     {OPD(PF_38_NONE, 0xF0), 2, &OpDispatchBuilder::MOVBEOp},
     {OPD(PF_38_66, 0xF0), 2, &OpDispatchBuilder::MOVBEOp},
 
@@ -8600,6 +8630,7 @@ constexpr uint16_t PF_F2 = 3;
 #define PF_3A_NONE 0
 #define PF_3A_66   1
   const std::vector<std::tuple<uint16_t, uint8_t, FEXCore::X86Tables::OpDispatchPtr>> H0F3ATable = {
+    {OPD(0, PF_3A_NONE, 0x0F), 1, &OpDispatchBuilder::PAlignrOp},
     {OPD(0, PF_3A_66,   0x0F), 1, &OpDispatchBuilder::PAlignrOp},
     {OPD(1, PF_3A_66,   0x0F), 1, &OpDispatchBuilder::PAlignrOp},
   };

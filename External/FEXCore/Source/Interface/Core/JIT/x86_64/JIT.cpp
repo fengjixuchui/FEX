@@ -4130,7 +4130,17 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
         }
         case IR::OP_VEXTR: {
           auto Op = IROp->C<IR::IROp_VExtr>();
-          vpalignr(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()), Op->Index);
+          if (OpSize == 8) {
+            // No way to do this with 64bit source without dropping to MMX
+            // So emulate it
+            vpxor(xmm14, xmm14, xmm14);
+            movq(xmm15, GetSrc(Op->Header.Args[1].ID()));
+            vshufpd(xmm15, xmm15, GetSrc(Op->Header.Args[0].ID()), 0b00);
+            vpalignr(GetDst(Node), xmm14, xmm15, Op->Index);
+          }
+          else {
+            vpalignr(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()), Op->Index);
+          }
           break;
         }
         case IR::OP_VUMIN: {
@@ -4209,6 +4219,23 @@ void *JITCore::CompileCode([[maybe_unused]] FEXCore::IR::IRListView<true> const 
           }
           break;
         }
+        case IR::OP_VTBL1: {
+          auto Op = IROp->C<IR::IROp_VTBL1>();
+          switch (OpSize) {
+          case 8: {
+            vpshufb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()));
+            movq(GetDst(Node), GetDst(Node));
+            break;
+          }
+          case 16: {
+            vpshufb(GetDst(Node), GetSrc(Op->Header.Args[0].ID()), GetSrc(Op->Header.Args[1].ID()));
+            break;
+          }
+          default: LogMan::Msg::A("Unknown OpSize: %d", OpSize); break;
+          }
+          break;
+        }
+
         case IR::OP_FLOAT_FROMGPR_S: {
           auto Op = IROp->C<IR::IROp_Float_FromGPR_S>();
           if (Op->Header.ElementSize == 8) {

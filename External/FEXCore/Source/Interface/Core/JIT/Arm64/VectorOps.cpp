@@ -1548,8 +1548,29 @@ DEF_OP(VExtractElement) {
 
 DEF_OP(VExtr) {
   auto Op = IROp->C<IR::IROp_VExtr>();
+  uint8_t OpSize = IROp->Size;
+
   // AArch64 ext op has bit arrangement as [Vm:Vn] so arguments need to be swapped
-  ext(GetDst(Node).V16B(), GetSrc(Op->Header.Args[1].ID()).V16B(), GetSrc(Op->Header.Args[0].ID()).V16B(), Op->Index * Op->Header.ElementSize);
+  auto UpperBits = GetSrc(Op->Header.Args[0].ID());
+  auto LowerBits = GetSrc(Op->Header.Args[1].ID());
+  auto Index = Op->Index;
+
+  if (Index >= OpSize) {
+    // Upper bits have moved in to the lower bits
+    LowerBits = UpperBits;
+
+    // Upper bits are all now zero
+    UpperBits = VTMP1;
+    eor(VTMP1.V16B(), VTMP1.V16B(), VTMP1.V16B());
+    Index -= OpSize;
+  }
+
+  if (OpSize == 8) {
+    ext(GetDst(Node).V8B(), LowerBits.V8B(), UpperBits.V8B(), Index * Op->Header.ElementSize);
+  }
+  else {
+    ext(GetDst(Node).V16B(), LowerBits.V16B(), UpperBits.V16B(), Index * Op->Header.ElementSize);
+  }
 }
 
 DEF_OP(VSLI) {
@@ -2012,6 +2033,23 @@ DEF_OP(VSMull2) {
   }
 }
 
+DEF_OP(VTBL1) {
+  auto Op = IROp->C<IR::IROp_VTBL1>();
+  uint8_t OpSize = IROp->Size;
+
+  switch (OpSize) {
+    case 8: {
+      tbl(GetDst(Node).V8B(), GetSrc(Op->Header.Args[0].ID()).V16B(), GetSrc(Op->Header.Args[1].ID()).V8B());
+    break;
+    }
+    case 16: {
+      tbl(GetDst(Node).V16B(), GetSrc(Op->Header.Args[0].ID()).V16B(), GetSrc(Op->Header.Args[1].ID()).V16B());
+    break;
+    }
+    default: LogMan::Msg::A("Unknown OpSize: %d", OpSize); break;
+  }
+}
+
 #undef DEF_OP
 void JITCore::RegisterVectorHandlers() {
 #define REGISTER_OP(op, x) OpHandlers[FEXCore::IR::IROps::OP_##op] = &JITCore::Op_##x
@@ -2098,6 +2136,7 @@ void JITCore::RegisterVectorHandlers() {
   REGISTER_OP(VSMULL,            VSMull);
   REGISTER_OP(VUMULL2,           VUMull2);
   REGISTER_OP(VSMULL2,           VSMull2);
+  REGISTER_OP(VTBL1,             VTBL1);
 #undef REGISTER_OP
 }
 }

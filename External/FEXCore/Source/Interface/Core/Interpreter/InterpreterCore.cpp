@@ -3788,7 +3788,14 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             __uint128_t Src2 = *GetSrc<__uint128_t*>(SSAData, Op->Header.Args[1]);
 
             uint64_t Offset = Op->Index * Op->Header.ElementSize * 8;
-            __uint128_t Dst = (Src1 << (sizeof(__uint128_t) * 8 - Offset)) | (Src2 >> Offset);
+            __uint128_t Dst{};
+            if (Offset >= (OpSize * 8)) {
+              Offset -= OpSize * 8;
+              Dst = Src1 >> Offset;
+            }
+            else {
+              Dst = (Src1 << (OpSize * 8 - Offset)) | (Src2 >> Offset);
+            }
 
             memcpy(GDP, &Dst, OpSize);
             break;
@@ -3973,6 +3980,21 @@ void InterpreterCore::ExecuteCode(FEXCore::Core::InternalThreadState *Thread) {
             GD = ResultFlags;
             break;
           }
+          case IR::OP_VTBL1: {
+            auto Op = IROp->C<IR::IROp_VTBL1>();
+            uint8_t *Src1 = GetSrc<uint8_t*>(SSAData, Op->Header.Args[0]);
+            uint8_t *Src2 = GetSrc<uint8_t*>(SSAData, Op->Header.Args[1]);
+
+            uint8_t Tmp[16];
+
+            for (size_t i = 0; i < OpSize; ++i) {
+              uint8_t Index = Src2[i];
+              Tmp[i] = Index >= OpSize ? 0 : Src1[Index];
+            }
+            memcpy(GDP, Tmp, OpSize);
+            break;
+          }
+
           case IR::OP_GETHOSTFLAG: {
             auto Op = IROp->C<IR::IROp_GetHostFlag>();
             GD = (*GetSrc<uint64_t*>(SSAData, Op->Header.Args[0]) >> Op->Flag) & 1;
